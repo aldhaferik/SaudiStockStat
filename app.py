@@ -835,18 +835,24 @@ def walk_forward_spread_forecast(
         meta.append({"period": "Test Start (OOS)", "date": idx[ts_idx]})
 
     return preds, meta
+# =========================================================
+# app.py — PART 4
+# Continue inside analyze_stock() AFTER eps_ttm_daily has been built.
+# This part completes: BVPS, EBITDA, FCFF, growth, WACC, multiples models,
+# valuation anchor, spread forecast, chart series, backtest rows, and response.
+# =========================================================
 
-        # ---- BVPS daily (equity / shares) ----
+    # ---- BVPS daily (equity / shares) ----
     if eq_q is not None and eq_q.dropna().size >= 1:
         eq_daily = last_value_on_or_before(eq_q, dates)
         bvps_daily = eq_daily / shares_daily.replace(0.0, np.nan)
     else:
-            # fallback: info bookValue is usually per-share
+        # fallback: info bookValue is usually per-share
         bookv = _to_float(info.get("bookValue"))
         bvps_daily = pd.Series(index=dates, data=(bookv if bookv is not None else np.nan), dtype=float)
 
-        # ---- EBITDA TTM daily (best-effort) ----
-        # If not present directly, approximate EBITDA = EBIT + D&A (TTM)
+    # ---- EBITDA TTM daily (best-effort) ----
+    # If not present directly, approximate EBITDA = EBIT + D&A (TTM)
     ebitda_ttm_daily = pd.Series(index=dates, dtype=float)
     if ebit_q is not None and ebit_q.dropna().size >= 4:
         ebit_ttm = ttm_from_quarters(ebit_q)
@@ -858,11 +864,11 @@ def walk_forward_spread_forecast(
         else:
             ebitda_ttm_daily = ebit_ttm_daily
     else:
-            # fallback: info ebitda (usually trailing 12m) constant
+        # fallback: info ebitda (usually trailing 12m) constant
         ebitda_info = _to_float(info.get("ebitda"))
         ebitda_ttm_daily = pd.Series(index=dates, data=(ebitda_info if ebitda_info is not None else np.nan), dtype=float)
 
-        # ---- FCFF TTM daily (CFO - CapEx), best-effort ----
+    # ---- FCFF TTM daily (CFO - CapEx), best-effort ----
     fcff_ttm_daily = pd.Series(index=dates, dtype=float)
     if cfo_q is not None and cfo_q.dropna().size >= 4 and capex_q is not None and capex_q.dropna().size >= 4:
         cfo_ttm = ttm_from_quarters(cfo_q)
@@ -870,7 +876,7 @@ def walk_forward_spread_forecast(
         cfo_ttm_daily = last_value_on_or_before(cfo_ttm, dates)
         capex_ttm_daily = last_value_on_or_before(capex_ttm, dates)
 
-            # normalize capex sign: cashflow often reports capex as negative outflow
+        # normalize capex sign: cashflow often reports capex as negative outflow
         cap = capex_ttm_daily.values.astype(float)
         cap = np.where(np.isfinite(cap), cap, np.nan)
         cap_out = np.where(cap < 0, -cap, cap)
@@ -880,7 +886,7 @@ def walk_forward_spread_forecast(
     else:
         method_flags["fcff"] = "unavailable"
 
-        # ---- Growth estimate (data-driven from FCFF YoY else EPS YoY else 0) ----
+    # ---- Growth estimate (data-driven from FCFF YoY else EPS YoY else 0) ----
     growth_daily = pd.Series(index=dates, dtype=float)
     if fcff_ttm_daily.dropna().size > 400:
         g = (fcff_ttm_daily / fcff_ttm_daily.shift(TRADING_DAYS)) - 1.0
@@ -894,30 +900,28 @@ def walk_forward_spread_forecast(
         growth_daily = pd.Series(index=dates, data=0.0, dtype=float)
         method_flags["growth"] = "fallback_zero_due_to_insufficient_history"
 
-        # ---- WACC (data-minimal): cost of debt proxy = rf, weights from E vs D (time-varying net debt) ----
+    # ---- WACC (data-minimal): cost of debt proxy = rf, weights from E vs D ----
     D = net_debt_daily.clip(lower=0.0)
-        # Prefer daily market cap if volume/shares stable; but we keep it simple + stable: shares * close
     E = (shares_daily.replace(0.0, np.nan) * close_series).astype(float)
     Vcap = (D + E).replace(0.0, np.nan)
     wd = (D / Vcap).clip(0.0, 0.95)
     we = (E / Vcap).clip(0.05, 1.0)
-    Rd = rf  # proxy when interest expense isn't reliably extractable
+    Rd = rf  
     wacc_daily = (we * Re + wd * Rd * (1.0 - T)).clip(0.0, WACC_MAX)
     method_flags["wacc"] = "wacc_equity_capm_debt_rf_proxy"
 
-        # ---- Build observed multiples series ----
+    # ---- Build observed multiples series ----
     close_series = pd.Series(index=dates, data=stock_close.values.astype(float), dtype=float)
-
     pe_obs = close_series / eps_ttm_daily.replace(0.0, np.nan)
     pb_obs = close_series / bvps_daily.replace(0.0, np.nan)
 
     ev_daily = (close_series * shares_daily.replace(0.0, np.nan)) + net_debt_daily
     ev_ebitda_obs = ev_daily / ebitda_ttm_daily.replace(0.0, np.nan)
 
-        # ---- Self-anchored target multiples (rolling median of own history) ----
+    # ---- Self-anchored target multiples (rolling median of own history) ----
     def rolling_target_multiple(obs: pd.Series, window: int = TRADING_DAYS * 2) -> pd.Series:
         m = obs.replace([np.inf, -np.inf], np.nan).copy()
-        m = m.where(m > 0)  # multiples must be positive to be meaningful
+        m = m.where(m > 0)
         ql = m.rolling(window).quantile(0.10)
         qh = m.rolling(window).quantile(0.90)
         m_clip = m.clip(lower=ql, upper=qh)
@@ -931,11 +935,12 @@ def walk_forward_spread_forecast(
     pb_model = pb_target * bvps_daily
     ev_ebitda_model = (ev_ebitda_target * ebitda_ttm_daily - net_debt_daily) / shares_daily.replace(0.0, np.nan)
 
-        # ---- DCF model daily (only if FCFF available) ----
+    # ---- DCF model daily (only if FCFF available) ----
     dcf_model = pd.Series(index=dates, dtype=float)
-    market_long_run_g = rm_exp  # data-driven cap from TASI CAGR
+    market_long_run_g = rm_exp
+
     if fcff_ttm_daily.dropna().size > 200:
-        dcf_vals: List[float] = []
+        dcf_vals = []
         for dt in dates:
             fcff0 = float(fcff_ttm_daily.loc[dt]) if np.isfinite(fcff_ttm_daily.loc[dt]) else np.nan
             w = float(wacc_daily.loc[dt]) if np.isfinite(wacc_daily.loc[dt]) else np.nan
@@ -960,7 +965,7 @@ def walk_forward_spread_forecast(
                 dcf_vals.append(np.nan)
         dcf_model = pd.Series(index=dates, data=np.array(dcf_vals, dtype=float), dtype=float)
 
-        # ---- Build valuation matrix X (models) ----
+    # ---- Build valuation matrix X (models) ----
     models = {
         "dcf": dcf_model,
         "pe": pe_model,
@@ -973,198 +978,172 @@ def walk_forward_spread_forecast(
         models["pe"].values.astype(float),
         models["pb"].values.astype(float),
         models["ev_ebitda"].values.astype(float),
-       ])
+    ])
 
-        avail = np.array([
-            np.isfinite(models["dcf"]).sum() > 150,
-            np.isfinite(models["pe"]).sum() > 150,
-            np.isfinite(models["pb"]).sum() > 150,
-            np.isfinite(models["ev_ebitda"]).sum() > 150,
-        ], dtype=bool)
+    avail = np.array([
+        np.isfinite(models["dcf"]).sum() > 150,
+        np.isfinite(models["pe"]).sum() > 150,
+        np.isfinite(models["pb"]).sum() > 150,
+        np.isfinite(models["ev_ebitda"]).sum() > 150,
+    ], dtype=bool)
 
-        if not np.any(avail):
-            return JSONResponse(
-                {"error": "No valuation models available: insufficient EPS/BV/EBITDA/FCFF coverage from source."},
-                status_code=200
-            )
-
-        # ---- Train valuation weights on past (avoid future) ----
-        y_all = close_series.values.astype(float)
-        n = len(dates)
-        train_start_idx = max(0, n - TRAIN_WINDOW_DAYS)
-        y_train = y_all[train_start_idx:]
-        X_train = X[:, train_start_idx:]
-
-        try:
-            w_val = optimize_weights_dirichlet(y_train, X_train, avail, n_samples=N_WEIGHT_SAMPLES)
-        except Exception:
-            w_val = np.zeros(4, dtype=float)
-            idxs = np.where(avail)[0]
-            w_val[idxs] = 1.0 / len(idxs)
-
-        V_anchor = np.nansum((X.T * w_val), axis=1)
-        V_anchor = pd.Series(index=dates, data=V_anchor.astype(float), dtype=float)
-
-        # =========================================================
-        # Spread engine: predict spread dynamics (liquidity/sentiment/regime proxies)
-        # =========================================================
-        df_core = pd.DataFrame(index=dates)
-        df_core["Close"] = close_series.astype(float)
-        df_core["MktClose"] = pd.Series(index=dates, data=mkt_close.reindex(dates).values.astype(float), dtype=float)
-        df_core["V_anchor"] = V_anchor.astype(float)
-
-        # Try to obtain volume from Yahoo 'hist' if present
-        vol_series = None
-        try:
-            if isinstance(hist, pd.DataFrame) and "Volume" in hist.columns:
-                v = pd.to_numeric(hist["Volume"], errors="coerce")
-                v = v.reindex(dates).astype(float)
-                if v.dropna().size > 50:
-                    vol_series = v
-        except Exception:
-            vol_series = None
-        if vol_series is not None:
-            df_core["Volume"] = vol_series
-
-        feat = build_spread_features(df_core, shares_daily)
-
-        # Target: realized spread at date t; features are shifted by horizon inside walk_forward_spread_forecast
-        delta_pct = (df_core["Close"] - df_core["V_anchor"]) / df_core["V_anchor"].replace(0.0, np.nan)
-        y_target = delta_pct.astype(float)
-
-        preds_delta, backtest_meta = walk_forward_spread_forecast(
-            df_feat=feat,
-            y_target=y_target,
-            horizon=SPREAD_HORIZON_DAYS,
-            train_days=TRAIN_WINDOW_DAYS,
-            test_days=TEST_WINDOW_DAYS,
+    if not np.any(avail):
+        return JSONResponse(
+            {"error": "No valuation models available."},
+            status_code=200
         )
 
-        # Build predicted price series aligned to realized dates:
-        # For realized date t, valuation anchor used must be V at (t-h)
-        V_lag = V_anchor.shift(SPREAD_HORIZON_DAYS)
-        P_hat_realized = V_lag * (1.0 + preds_delta)
+    # ---- Train valuation weights on past ----
+    y_all = close_series.values.astype(float)
+    n = len(dates)
+    train_start_idx = max(0, n - TRAIN_WINDOW_DAYS)
+    y_train = y_all[train_start_idx:]
+    X_train = X[:, train_start_idx:]
 
-        # Today's forward-looking 1M forecast: use latest available spread-prediction (from last OOS point),
-        # anchored on today's valuation level.
-        delta_hat_now = np.nan
-        if preds_delta.dropna().size:
-            delta_hat_now = float(preds_delta.dropna().iloc[-1])
-        else:
-            # fallback to current observed spread
-            delta_hat_now = float(delta_pct.dropna().iloc[-1]) if delta_pct.dropna().size else 0.0
+    try:
+        w_val = optimize_weights_dirichlet(y_train, X_train, avail, n_samples=N_WEIGHT_SAMPLES)
+    except Exception:
+        w_val = np.zeros(4, dtype=float)
+        idxs = np.where(avail)[0]
+        w_val[idxs] = 1.0 / len(idxs)
 
-        V_now = float(V_anchor.iloc[-1]) if np.isfinite(V_anchor.iloc[-1]) else float(current_price)
-        fair_value_1m = V_now * (1.0 + delta_hat_now)
+    V_anchor = np.nansum((X.T * w_val), axis=1)
+    V_anchor = pd.Series(index=dates, data=V_anchor.astype(float), dtype=float)
 
-        # Backtest rows: compare predicted price vs actual at realized dates
-        backtest = []
-        for row in backtest_meta:
-            d = row["date"]
-            actual = float(df_core.loc[d, "Close"]) if d in df_core.index else np.nan
-            modelv = float(P_hat_realized.loc[d]) if d in P_hat_realized.index else np.nan
-            if np.isfinite(actual) and np.isfinite(modelv) and actual > 0:
-                backtest.append({"period": row["period"], "actual": actual, "model": modelv})
+    # ---- Spread engine ----
+    df_core = pd.DataFrame(index=dates)
+    df_core["Close"] = close_series.astype(float)
+    df_core["MktClose"] = pd.Series(index=dates, data=mkt_close.reindex(dates).values.astype(float), dtype=float)
+    df_core["V_anchor"] = V_anchor.astype(float)
 
-        # Historical series for chart: use realized predicted price, then fill for display (no fillna(method=...))
-        fair_series_for_chart = P_hat_realized.reindex(dates).astype(float)
-        fair_series_for_chart = fair_series_for_chart.ffill().bfill()
-        fair_values_list = fair_series_for_chart.tolist()
+    vol_series = None
+    try:
+        if isinstance(hist, pd.DataFrame) and "Volume" in hist.columns:
+            v = pd.to_numeric(hist["Volume"], errors="coerce").reindex(dates).astype(float)
+            if v.dropna().size > 50:
+                vol_series = v
+    except Exception:
+        vol_series = None
 
-        # Returns
-        def pct_return(series: pd.Series, days: int) -> Optional[float]:
-            s = series.dropna()
-            if s.size < days + 1:
-                return None
-            a = float(s.iloc[-1])
-            b = float(s.iloc[-(days + 1)])
-            if b <= 0:
-                return None
-            return (a / b - 1.0) * 100.0
+    if vol_series is not None:
+        df_core["Volume"] = vol_series
 
-        returns = {
-            "1m": pct_return(close_series, 21),
-            "3m": pct_return(close_series, 63),
-            "6m": pct_return(close_series, 126),
-            "1y": pct_return(close_series, 252),
-            "2y": pct_return(close_series, 504),
-        }
+    feat = build_spread_features(df_core, shares_daily)
+    delta_pct = (df_core["Close"] - df_core["V_anchor"]) / df_core["V_anchor"].replace(0.0, np.nan)
+    y_target = delta_pct.astype(float)
 
-        # Present-day headline multiples (from last available)
-        eps_now = float(eps_ttm_daily.iloc[-1]) if np.isfinite(eps_ttm_daily.iloc[-1]) else np.nan
-        bvps_now = float(bvps_daily.iloc[-1]) if np.isfinite(bvps_daily.iloc[-1]) else np.nan
+    preds_delta, backtest_meta = walk_forward_spread_forecast(
+        df_feat=feat,
+        y_target=y_target,
+        horizon=SPREAD_HORIZON_DAYS,
+        train_days=TRAIN_WINDOW_DAYS,
+        test_days=TEST_WINDOW_DAYS,
+    )
 
-        pe_now = safe_div(current_price, eps_now) if np.isfinite(eps_now) and eps_now != 0 else np.nan
-        book_value_now = (bvps_now * float(shares_daily.iloc[-1])) if np.isfinite(bvps_now) else np.nan
+    V_lag = V_anchor.shift(SPREAD_HORIZON_DAYS)
+    P_hat_realized = V_lag * (1.0 + preds_delta)
 
-        # Model breakdown at "now" (spot valuation models, not spread forecast)
-        model_breakdown = {
-            "dcf": float(dcf_model.iloc[-1]) if np.isfinite(dcf_model.iloc[-1]) else None,
-            "pe_model": float(pe_model.iloc[-1]) if np.isfinite(pe_model.iloc[-1]) else None,
-            "pb_model": float(pb_model.iloc[-1]) if np.isfinite(pb_model.iloc[-1]) else None,
-            "ev_ebitda_model": float(ev_ebitda_model.iloc[-1]) if np.isfinite(ev_ebitda_model.iloc[-1]) else None,
-        }
+    if preds_delta.dropna().size:
+        delta_hat_now = float(preds_delta.dropna().iloc[-1])
+    else:
+        delta_hat_now = float(delta_pct.dropna().iloc[-1]) if delta_pct.dropna().size else 0.0
 
-        # DCF projections (display only): using latest fcff and growth
+    V_now = float(V_anchor.iloc[-1]) if np.isfinite(V_anchor.iloc[-1]) else float(current_price)
+    fair_value_1m = V_now * (1.0 + delta_hat_now)
+
+    # ---- Backtest rows ----
+    backtest = []
+    for row in backtest_meta:
+        d = row["date"]
+        actual = float(df_core.loc[d, "Close"]) if d in df_core.index else np.nan
+        modelv = float(P_hat_realized.loc[d]) if d in P_hat_realized.index else np.nan
+        if np.isfinite(actual) and np.isfinite(modelv) and actual > 0:
+            backtest.append({"period": row["period"], "actual": actual, "model": modelv})
+
+    fair_series_for_chart = P_hat_realized.reindex(dates).astype(float).ffill().bfill()
+    fair_values_list = fair_series_for_chart.tolist()
+
+    # ---- Returns ----
+    def pct_return(series: pd.Series, days: int) -> Optional[float]:
+        s = series.dropna()
+        if s.size < days + 1:
+            return None
+        a, b = float(s.iloc[-1]), float(s.iloc[-(days + 1)])
+        return (a / b - 1.0) * 100.0 if b > 0 else None
+
+    returns = {
+        "1m": pct_return(close_series, 21),
+        "3m": pct_return(close_series, 63),
+        "6m": pct_return(close_series, 126),
+        "1y": pct_return(close_series, 252),
+        "2y": pct_return(close_series, 504),
+    }
+
+    eps_now = float(eps_ttm_daily.iloc[-1]) if np.isfinite(eps_ttm_daily.iloc[-1]) else np.nan
+    bvps_now = float(bvps_daily.iloc[-1]) if np.isfinite(bvps_daily.iloc[-1]) else np.nan
+    pe_now = safe_div(current_price, eps_now) if np.isfinite(eps_now) and eps_now != 0 else np.nan
+    book_value_now = (bvps_now * float(shares_daily.iloc[-1])) if np.isfinite(bvps_now) else np.nan
+
+    model_breakdown = {
+        "dcf": float(dcf_model.iloc[-1]) if np.isfinite(dcf_model.iloc[-1]) else None,
+        "pe_model": float(pe_model.iloc[-1]) if np.isfinite(pe_model.iloc[-1]) else None,
+        "pb_model": float(pb_model.iloc[-1]) if np.isfinite(pb_model.iloc[-1]) else None,
+        "ev_ebitda_model": float(ev_ebitda_model.iloc[-1]) if np.isfinite(ev_ebitda_model.iloc[-1]) else None,
+    }
+
+    dcf_proj = []
+    try:
+        fcff0 = float(fcff_ttm_daily.iloc[-1]) if np.isfinite(fcff_ttm_daily.iloc[-1]) else np.nan
+        g0 = float(growth_daily.iloc[-1]) if np.isfinite(growth_daily.iloc[-1]) else 0.0
+        if np.isfinite(fcff0) and fcff0 > 0:
+            for i in range(1, FORECAST_YEARS + 1):
+                dcf_proj.append(float(fcff0 * ((1.0 + g0) ** i)))
+    except Exception:
         dcf_proj = []
-        try:
-            fcff0 = float(fcff_ttm_daily.iloc[-1]) if np.isfinite(fcff_ttm_daily.iloc[-1]) else np.nan
-            g0 = float(growth_daily.iloc[-1]) if np.isfinite(growth_daily.iloc[-1]) else 0.0
-            if np.isfinite(fcff0) and fcff0 > 0:
-                for i in range(1, FORECAST_YEARS + 1):
-                    dcf_proj.append(float(fcff0 * ((1.0 + g0) ** i)))
-        except Exception:
-            dcf_proj = []
 
-        upside = safe_div((fair_value_1m - current_price), current_price) * 100.0 if current_price > 0 else 0.0
-        if np.isfinite(upside):
-            if upside > 8:
-                verdict = "Undervalued"
-            elif upside < -8:
-                verdict = "Overvalued"
-            else:
-                verdict = "Fairly Valued"
-        else:
-            verdict = "Fairly Valued"
-            upside = 0.0
+    upside = safe_div((fair_value_1m - current_price), current_price) * 100.0 if current_price > 0 else 0.0
+    if np.isfinite(upside):
+        if upside > 8: verdict = "Undervalued"
+        elif upside < -8: verdict = "Overvalued"
+        else: verdict = "Fairly Valued"
+    else:
+        verdict, upside = "Fairly Valued", 0.0
 
-        response = {
-            "valuation_summary": {
-                "company_name": company_name,
-                "sector": sector,
-                "current_price": current_price,
-                "fair_value": float(fair_value_1m) if np.isfinite(fair_value_1m) else None,
-                "upside_percent": float(upside) if np.isfinite(upside) else None,
-                "verdict": verdict,
-                "model_breakdown": model_breakdown,
-                "dcf_projections": dcf_proj,
-                "method_flags": method_flags,
-            },
-            "metrics": {
-                "market_cap": float(mcap_now) if np.isfinite(mcap_now) else None,
-                "pe_ratio": float(pe_now) if np.isfinite(pe_now) else None,
-                "eps": float(eps_now) if np.isfinite(eps_now) else None,
-                "beta": float(beta) if np.isfinite(beta) else None,
-                "growth_rate": float(growth_daily.iloc[-1]) if np.isfinite(growth_daily.iloc[-1]) else None,
-                "book_value": float(book_value_now) if np.isfinite(book_value_now) else None,
-                "wacc": float(wacc_daily.iloc[-1]) if np.isfinite(wacc_daily.iloc[-1]) else None,
-            },
-            "returns": returns,
-            "optimized_weights": {
-                "dcf": float(w_val[0]),
-                "pe": float(w_val[1]),
-                "pb": float(w_val[2]),
-                "ev_ebitda": float(w_val[3]),
-            },
-            "backtest": backtest,
-            "historical_data": {
-                "dates": dates_ms,
-                "prices": prices_list,
-                "fair_values": fair_values_list,
-            },
-        }
+    response = {
+        "valuation_summary": {
+            "company_name": company_name,
+            "sector": sector,
+            "current_price": current_price,
+            "fair_value": float(fair_value_1m) if np.isfinite(fair_value_1m) else None,
+            "upside_percent": float(upside),
+            "verdict": verdict,
+            "model_breakdown": model_breakdown,
+            "dcf_projections": dcf_proj,
+            "method_flags": method_flags,
+        },
+        "metrics": {
+            "market_cap": float(mcap_now) if np.isfinite(mcap_now) else None,
+            "pe_ratio": float(pe_now) if np.isfinite(pe_now) else None,
+            "eps": float(eps_now) if np.isfinite(eps_now) else None,
+            "beta": float(beta) if np.isfinite(beta) else None,
+            "growth_rate": float(growth_daily.iloc[-1]) if np.isfinite(growth_daily.iloc[-1]) else None,
+            "book_value": float(book_value_now) if np.isfinite(book_value_now) else None,
+            "wacc": float(wacc_daily.iloc[-1]) if np.isfinite(wacc_daily.iloc[-1]) else None,
+        },
+        "returns": returns,
+        "optimized_weights": {
+            "dcf": float(w_val[0]), "pe": float(w_val[1]),
+            "pb": float(w_val[2]), "ev_ebitda": float(w_val[3]),
+        },
+        "backtest": backtest,
+        "historical_data": {
+            "dates": dates_ms,
+            "prices": prices_list,
+            "fair_values": fair_values_list,
+        },
+    }
 
-        return JSONResponse(json_safe(response), status_code=200)
+    return JSONResponse(json_safe(response), status_code=200)
 # =========================================================
 # app.py — PART 5
 # Missing pieces referenced by PART 4:

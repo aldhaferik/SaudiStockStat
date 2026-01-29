@@ -835,152 +835,145 @@ def walk_forward_spread_forecast(
         meta.append({"period": "Test Start (OOS)", "date": idx[ts_idx]})
 
     return preds, meta
-# =========================================================
-# app.py — PART 4
-# Continue inside analyze_stock() AFTER eps_ttm_daily has been built.
-# This part completes: BVPS, EBITDA, FCFF, growth, WACC, multiples models,
-# valuation anchor, spread forecast, chart series, backtest rows, and response.
-# =========================================================
 
         # ---- BVPS daily (equity / shares) ----
-        if eq_q is not None and eq_q.dropna().size >= 1:
-            eq_daily = last_value_on_or_before(eq_q, dates)
-            bvps_daily = eq_daily / shares_daily.replace(0.0, np.nan)
-        else:
+    if eq_q is not None and eq_q.dropna().size >= 1:
+        eq_daily = last_value_on_or_before(eq_q, dates)
+        bvps_daily = eq_daily / shares_daily.replace(0.0, np.nan)
+    else:
             # fallback: info bookValue is usually per-share
-            bookv = _to_float(info.get("bookValue"))
-            bvps_daily = pd.Series(index=dates, data=(bookv if bookv is not None else np.nan), dtype=float)
+        bookv = _to_float(info.get("bookValue"))
+        bvps_daily = pd.Series(index=dates, data=(bookv if bookv is not None else np.nan), dtype=float)
 
         # ---- EBITDA TTM daily (best-effort) ----
         # If not present directly, approximate EBITDA = EBIT + D&A (TTM)
-        ebitda_ttm_daily = pd.Series(index=dates, dtype=float)
-        if ebit_q is not None and ebit_q.dropna().size >= 4:
-            ebit_ttm = ttm_from_quarters(ebit_q)
-            ebit_ttm_daily = last_value_on_or_before(ebit_ttm, dates)
-            if da_q is not None and da_q.dropna().size >= 4:
-                da_ttm = ttm_from_quarters(da_q)
-                da_ttm_daily = last_value_on_or_before(da_ttm, dates)
-                ebitda_ttm_daily = ebit_ttm_daily + da_ttm_daily
-            else:
-                ebitda_ttm_daily = ebit_ttm_daily
+    ebitda_ttm_daily = pd.Series(index=dates, dtype=float)
+    if ebit_q is not None and ebit_q.dropna().size >= 4:
+        ebit_ttm = ttm_from_quarters(ebit_q)
+        ebit_ttm_daily = last_value_on_or_before(ebit_ttm, dates)
+        if da_q is not None and da_q.dropna().size >= 4:
+            da_ttm = ttm_from_quarters(da_q)
+            da_ttm_daily = last_value_on_or_before(da_ttm, dates)
+            ebitda_ttm_daily = ebit_ttm_daily + da_ttm_daily
         else:
+            ebitda_ttm_daily = ebit_ttm_daily
+    else:
             # fallback: info ebitda (usually trailing 12m) constant
-            ebitda_info = _to_float(info.get("ebitda"))
-            ebitda_ttm_daily = pd.Series(index=dates, data=(ebitda_info if ebitda_info is not None else np.nan), dtype=float)
+        ebitda_info = _to_float(info.get("ebitda"))
+        ebitda_ttm_daily = pd.Series(index=dates, data=(ebitda_info if ebitda_info is not None else np.nan), dtype=float)
 
         # ---- FCFF TTM daily (CFO - CapEx), best-effort ----
-        fcff_ttm_daily = pd.Series(index=dates, dtype=float)
-        if cfo_q is not None and cfo_q.dropna().size >= 4 and capex_q is not None and capex_q.dropna().size >= 4:
-            cfo_ttm = ttm_from_quarters(cfo_q)
-            capex_ttm = ttm_from_quarters(capex_q)
-            cfo_ttm_daily = last_value_on_or_before(cfo_ttm, dates)
-            capex_ttm_daily = last_value_on_or_before(capex_ttm, dates)
+    fcff_ttm_daily = pd.Series(index=dates, dtype=float)
+    if cfo_q is not None and cfo_q.dropna().size >= 4 and capex_q is not None and capex_q.dropna().size >= 4:
+        cfo_ttm = ttm_from_quarters(cfo_q)
+        capex_ttm = ttm_from_quarters(capex_q)
+        cfo_ttm_daily = last_value_on_or_before(cfo_ttm, dates)
+        capex_ttm_daily = last_value_on_or_before(capex_ttm, dates)
 
             # normalize capex sign: cashflow often reports capex as negative outflow
-            cap = capex_ttm_daily.values.astype(float)
-            cap = np.where(np.isfinite(cap), cap, np.nan)
-            cap_out = np.where(cap < 0, -cap, cap)
+        cap = capex_ttm_daily.values.astype(float)
+        cap = np.where(np.isfinite(cap), cap, np.nan)
+        cap_out = np.where(cap < 0, -cap, cap)
 
-            fcff_ttm_daily = pd.Series(index=dates, data=(cfo_ttm_daily.values.astype(float) - cap_out), dtype=float)
-            method_flags["fcff"] = "ttm_cfo_minus_capex"
-        else:
-            method_flags["fcff"] = "unavailable"
+        fcff_ttm_daily = pd.Series(index=dates, data=(cfo_ttm_daily.values.astype(float) - cap_out), dtype=float)
+        method_flags["fcff"] = "ttm_cfo_minus_capex"
+    else:
+        method_flags["fcff"] = "unavailable"
 
         # ---- Growth estimate (data-driven from FCFF YoY else EPS YoY else 0) ----
-        growth_daily = pd.Series(index=dates, dtype=float)
-        if fcff_ttm_daily.dropna().size > 400:
-            g = (fcff_ttm_daily / fcff_ttm_daily.shift(TRADING_DAYS)) - 1.0
-            growth_daily = g.clip(GROWTH_MIN, GROWTH_MAX)
-            method_flags["growth"] = "fcff_yoy"
-        elif eps_ttm_daily.dropna().size > 400:
-            g = (eps_ttm_daily / eps_ttm_daily.shift(TRADING_DAYS)) - 1.0
-            growth_daily = g.clip(GROWTH_MIN, GROWTH_MAX)
-            method_flags["growth"] = "eps_yoy"
-        else:
-            growth_daily = pd.Series(index=dates, data=0.0, dtype=float)
-            method_flags["growth"] = "fallback_zero_due_to_insufficient_history"
+    growth_daily = pd.Series(index=dates, dtype=float)
+    if fcff_ttm_daily.dropna().size > 400:
+        g = (fcff_ttm_daily / fcff_ttm_daily.shift(TRADING_DAYS)) - 1.0
+        growth_daily = g.clip(GROWTH_MIN, GROWTH_MAX)
+        method_flags["growth"] = "fcff_yoy"
+    elif eps_ttm_daily.dropna().size > 400:
+        g = (eps_ttm_daily / eps_ttm_daily.shift(TRADING_DAYS)) - 1.0
+        growth_daily = g.clip(GROWTH_MIN, GROWTH_MAX)
+        method_flags["growth"] = "eps_yoy"
+    else:
+        growth_daily = pd.Series(index=dates, data=0.0, dtype=float)
+        method_flags["growth"] = "fallback_zero_due_to_insufficient_history"
 
         # ---- WACC (data-minimal): cost of debt proxy = rf, weights from E vs D (time-varying net debt) ----
-        D = net_debt_daily.clip(lower=0.0)
+    D = net_debt_daily.clip(lower=0.0)
         # Prefer daily market cap if volume/shares stable; but we keep it simple + stable: shares * close
-        E = (shares_daily.replace(0.0, np.nan) * close_series).astype(float)
-        Vcap = (D + E).replace(0.0, np.nan)
-        wd = (D / Vcap).clip(0.0, 0.95)
-        we = (E / Vcap).clip(0.05, 1.0)
-        Rd = rf  # proxy when interest expense isn't reliably extractable
-        wacc_daily = (we * Re + wd * Rd * (1.0 - T)).clip(0.0, WACC_MAX)
-        method_flags["wacc"] = "wacc_equity_capm_debt_rf_proxy"
+    E = (shares_daily.replace(0.0, np.nan) * close_series).astype(float)
+    Vcap = (D + E).replace(0.0, np.nan)
+    wd = (D / Vcap).clip(0.0, 0.95)
+    we = (E / Vcap).clip(0.05, 1.0)
+    Rd = rf  # proxy when interest expense isn't reliably extractable
+    wacc_daily = (we * Re + wd * Rd * (1.0 - T)).clip(0.0, WACC_MAX)
+    method_flags["wacc"] = "wacc_equity_capm_debt_rf_proxy"
 
         # ---- Build observed multiples series ----
-        close_series = pd.Series(index=dates, data=stock_close.values.astype(float), dtype=float)
+    close_series = pd.Series(index=dates, data=stock_close.values.astype(float), dtype=float)
 
-        pe_obs = close_series / eps_ttm_daily.replace(0.0, np.nan)
-        pb_obs = close_series / bvps_daily.replace(0.0, np.nan)
+    pe_obs = close_series / eps_ttm_daily.replace(0.0, np.nan)
+    pb_obs = close_series / bvps_daily.replace(0.0, np.nan)
 
-        ev_daily = (close_series * shares_daily.replace(0.0, np.nan)) + net_debt_daily
-        ev_ebitda_obs = ev_daily / ebitda_ttm_daily.replace(0.0, np.nan)
+    ev_daily = (close_series * shares_daily.replace(0.0, np.nan)) + net_debt_daily
+    ev_ebitda_obs = ev_daily / ebitda_ttm_daily.replace(0.0, np.nan)
 
         # ---- Self-anchored target multiples (rolling median of own history) ----
-        def rolling_target_multiple(obs: pd.Series, window: int = TRADING_DAYS * 2) -> pd.Series:
-            m = obs.replace([np.inf, -np.inf], np.nan).copy()
-            m = m.where(m > 0)  # multiples must be positive to be meaningful
-            ql = m.rolling(window).quantile(0.10)
-            qh = m.rolling(window).quantile(0.90)
-            m_clip = m.clip(lower=ql, upper=qh)
-            return m_clip.rolling(window).median()
+    def rolling_target_multiple(obs: pd.Series, window: int = TRADING_DAYS * 2) -> pd.Series:
+        m = obs.replace([np.inf, -np.inf], np.nan).copy()
+        m = m.where(m > 0)  # multiples must be positive to be meaningful
+        ql = m.rolling(window).quantile(0.10)
+        qh = m.rolling(window).quantile(0.90)
+        m_clip = m.clip(lower=ql, upper=qh)
+        return m_clip.rolling(window).median()
 
-        pe_target = rolling_target_multiple(pe_obs)
-        pb_target = rolling_target_multiple(pb_obs)
-        ev_ebitda_target = rolling_target_multiple(ev_ebitda_obs)
+    pe_target = rolling_target_multiple(pe_obs)
+    pb_target = rolling_target_multiple(pb_obs)
+    ev_ebitda_target = rolling_target_multiple(ev_ebitda_obs)
 
-        pe_model = pe_target * eps_ttm_daily
-        pb_model = pb_target * bvps_daily
-        ev_ebitda_model = (ev_ebitda_target * ebitda_ttm_daily - net_debt_daily) / shares_daily.replace(0.0, np.nan)
+    pe_model = pe_target * eps_ttm_daily
+    pb_model = pb_target * bvps_daily
+    ev_ebitda_model = (ev_ebitda_target * ebitda_ttm_daily - net_debt_daily) / shares_daily.replace(0.0, np.nan)
 
         # ---- DCF model daily (only if FCFF available) ----
-        dcf_model = pd.Series(index=dates, dtype=float)
-        market_long_run_g = rm_exp  # data-driven cap from TASI CAGR
-
-        if fcff_ttm_daily.dropna().size > 200:
-            dcf_vals: List[float] = []
-            for dt in dates:
-                fcff0 = float(fcff_ttm_daily.loc[dt]) if np.isfinite(fcff_ttm_daily.loc[dt]) else np.nan
-                w = float(wacc_daily.loc[dt]) if np.isfinite(wacc_daily.loc[dt]) else np.nan
-                g = float(growth_daily.loc[dt]) if np.isfinite(growth_daily.loc[dt]) else np.nan
-                sh = float(shares_daily.loc[dt]) if np.isfinite(shares_daily.loc[dt]) else np.nan
-                nd = float(net_debt_daily.loc[dt]) if np.isfinite(net_debt_daily.loc[dt]) else 0.0
-                try:
-                    if np.isfinite(fcff0) and fcff0 > 0 and np.isfinite(w) and w > 0 and np.isfinite(g) and np.isfinite(sh) and sh > 0:
-                        dcf_ps = dcf_per_share_from_fcff(
-                            fcff0=fcff0,
-                            wacc=w,
-                            g=float(np.clip(g, GROWTH_MIN, GROWTH_MAX)),
-                            shares=sh,
-                            net_debt=nd,
-                            market_long_run_g=market_long_run_g,
-                            years=FORECAST_YEARS,
-                        )
-                        dcf_vals.append(float(dcf_ps) if np.isfinite(dcf_ps) else np.nan)
-                    else:
-                        dcf_vals.append(np.nan)
-                except Exception:
+    dcf_model = pd.Series(index=dates, dtype=float)
+    market_long_run_g = rm_exp  # data-driven cap from TASI CAGR
+    if fcff_ttm_daily.dropna().size > 200:
+        dcf_vals: List[float] = []
+        for dt in dates:
+            fcff0 = float(fcff_ttm_daily.loc[dt]) if np.isfinite(fcff_ttm_daily.loc[dt]) else np.nan
+            w = float(wacc_daily.loc[dt]) if np.isfinite(wacc_daily.loc[dt]) else np.nan
+            g = float(growth_daily.loc[dt]) if np.isfinite(growth_daily.loc[dt]) else np.nan
+            sh = float(shares_daily.loc[dt]) if np.isfinite(shares_daily.loc[dt]) else np.nan
+            nd = float(net_debt_daily.loc[dt]) if np.isfinite(net_debt_daily.loc[dt]) else 0.0
+            try:
+                if np.isfinite(fcff0) and fcff0 > 0 and np.isfinite(w) and w > 0 and np.isfinite(g) and np.isfinite(sh) and sh > 0:
+                    dcf_ps = dcf_per_share_from_fcff(
+                        fcff0=fcff0,
+                        wacc=w,
+                        g=float(np.clip(g, GROWTH_MIN, GROWTH_MAX)),
+                        shares=sh,
+                        net_debt=nd,
+                        market_long_run_g=market_long_run_g,
+                        years=FORECAST_YEARS,
+                    )
+                    dcf_vals.append(float(dcf_ps) if np.isfinite(dcf_ps) else np.nan)
+                else:
                     dcf_vals.append(np.nan)
-            dcf_model = pd.Series(index=dates, data=np.array(dcf_vals, dtype=float), dtype=float)
+            except Exception:
+                dcf_vals.append(np.nan)
+        dcf_model = pd.Series(index=dates, data=np.array(dcf_vals, dtype=float), dtype=float)
 
         # ---- Build valuation matrix X (models) ----
-        models = {
-            "dcf": dcf_model,
-            "pe": pe_model,
-            "pb": pb_model,
-            "ev_ebitda": ev_ebitda_model,
-        }
+    models = {
+        "dcf": dcf_model,
+        "pe": pe_model,
+        "pb": pb_model,
+        "ev_ebitda": ev_ebitda_model,
+    }
 
-        X = np.vstack([
-            models["dcf"].values.astype(float),
-            models["pe"].values.astype(float),
-            models["pb"].values.astype(float),
-            models["ev_ebitda"].values.astype(float),
-        ])
+    X = np.vstack([
+        models["dcf"].values.astype(float),
+        models["pe"].values.astype(float),
+        models["pb"].values.astype(float),
+        models["ev_ebitda"].values.astype(float),
+       ])
 
         avail = np.array([
             np.isfinite(models["dcf"]).sum() > 150,

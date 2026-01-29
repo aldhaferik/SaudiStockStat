@@ -344,7 +344,19 @@ async def analyze_stock(req: StockRequest):
                 match = [i for i in df.index if k.lower() in str(i).lower()]
                 if match: return df.loc[match[0]]
             return None
-
+# PLACE THIS INSIDE THE analyze_stock FUNCTION
+        def get_row(df, keys):
+            if df is None or df.empty: return None
+            # Normalize index for matching
+            df_clean = df.copy()
+            df_clean.index = [str(i).strip().lower() for i in df_clean.index]
+            
+            for k in keys:
+                # Case-insensitive partial matching to find 'eps', 'debt', etc.
+                match = [i for i in df_clean.index if k.lower() in i]
+                if match: 
+                    return df.iloc[df_clean.index.get_loc(match[0])]
+            return None
         # Core Components
         shares_q = get_row(stmts["bs_q"], ["Share Issued", "Ordinary Shares Number"])
         shares_daily = last_value_on_or_before(shares_q, dates).ffill()
@@ -357,7 +369,13 @@ async def analyze_stock(req: StockRequest):
         # 2. Financial Metrics
         eps_q = get_row(stmts["fin_q"], ["Diluted EPS", "Basic EPS"])
         eps_ttm_daily = last_value_on_or_before(ttm_from_quarters(eps_q) if eps_q is not None else None, dates).ffill()
-        
+        # PLACE THIS AFTER THE EPS EXTRACTION BLOCK
+        # Fallback for EPS if quarterly TTM fails (prevents fair_value = 0)
+        if eps_ttm_daily.dropna().empty or (eps_ttm_daily.iloc[-1] == 0):
+            trailing_eps = stmts["info"].get("trailingEps")
+            if trailing_eps:
+                eps_ttm_daily = pd.Series(index=dates, data=float(trailing_eps))
+                method_flags["eps"] = "fallback_info_trailingEps"
         net_debt_q = get_row(stmts["bs_q"], ["Net Debt"])
         net_debt_daily = last_value_on_or_before(net_debt_q, dates).ffill().fillna(0)
 
@@ -377,7 +395,11 @@ async def analyze_stock(req: StockRequest):
         pe_obs = close_series / eps_ttm_daily.replace(0, np.nan)
         pe_target = pe_obs.rolling(504, min_periods=60).median().ffill()
         pe_model = pe_target * eps_ttm_daily
-
+# PLACE THIS BEFORE BUILDING THE X MATRIX
+        if not np.any(avail):
+            return JSONResponse({
+                "error": f"Valuation aborted: Fundamental data (EPS/Book Value) not found for {ticker}."
+            }, status_code=200)
         # 5. Weights & Anchor
         X = np.vstack([pe_model.values]) # Simplified for stability
         avail = np.array([np.isfinite(pe_model).sum() > 100])

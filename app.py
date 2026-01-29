@@ -24,7 +24,13 @@ from pydantic import BaseModel
 # 0) APP + CORS
 # =========================================================
 app = FastAPI()
+@app.get("/", response_class=HTMLResponse)
+async def read_root():
+    return "<html><body><h2>Saudi Valuator Pro is running.</h2><p>Go to <a href='/docs'>/docs</a> or use POST /analyze</p></body></html>"
 
+@app.get("/health")
+def health():
+    return {"ok": True}
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

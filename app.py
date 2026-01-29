@@ -33,10 +33,31 @@ app = FastAPI()
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
-    return (
-        "<html><body><h2>Saudi Valuator Pro is running.</h2>"
-        "<p>Go to <a href='/docs'>/docs</a> or use POST /analyze</p></body></html>"
-    )
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Saudi Valuator Pro</title>
+  <style>
+    body { font-family: -apple-system, system-ui, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    a { color: #0b63ce; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .card { max-width: 820px; padding: 16px 18px; border: 1px solid #e5e7eb; border-radius: 12px; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Saudi Valuator Pro is running.</h2>
+    <p>Use the UI here: <a href="/ui">/ui</a></p>
+    <p>Or the API docs here: <a href="/docs">/docs</a></p>
+    <p>Or call <code>POST /analyze</code> with JSON like <code>{"ticker":"2222"}</code>.</p>
+  </div>
+</body>
+</html>
+"""
 
 
 @app.get("/health")
@@ -51,6 +72,90 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/ui", response_class=HTMLResponse)
+async def ui_page():
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Saudi Valuator Pro — UI</title>
+  <style>
+    body { font-family: -apple-system, system-ui, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    .wrap { max-width: 980px; }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    input { padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 10px; min-width: 220px; }
+    button { padding: 10px 14px; border: 0; border-radius: 10px; background: #0b63ce; color: white; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .card { margin-top: 16px; padding: 14px 16px; border: 1px solid #e5e7eb; border-radius: 12px; }
+    pre { background: #0b1020; color: #d1e7ff; padding: 12px; border-radius: 12px; overflow: auto; }
+    .muted { color: #6b7280; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>Saudi Valuator Pro — Web UI</h2>
+    <div class="row">
+      <input id="ticker" placeholder="Ticker (e.g., 2222 or 2222.SR)" />
+      <button id="runBtn" onclick="run()">Analyze</button>
+      <span class="muted" id="status"></span>
+    </div>
+
+    <div class="card">
+      <div class="muted">Result (raw JSON):</div>
+      <pre id="out">{}</pre>
+    </div>
+
+    <div class="card">
+      <div class="muted">Quick links:</div>
+      <div><a href="/docs">Open API Docs (/docs)</a></div>
+      <div><a href="/">Back to Home (/)</a></div>
+    </div>
+  </div>
+
+<script>
+async function run() {
+  const btn = document.getElementById("runBtn");
+  const status = document.getElementById("status");
+  const out = document.getElementById("out");
+  const ticker = document.getElementById("ticker").value.trim();
+
+  if (!ticker) {
+    status.textContent = "Enter a ticker first.";
+    return;
+  }
+
+  btn.disabled = true;
+  status.textContent = "Running...";
+  out.textContent = "{}";
+
+  try {
+    const r = await fetch("/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticker })
+    });
+
+    const data = await r.json();
+    out.textContent = JSON.stringify(data, null, 2);
+
+    if (data && data.error) {
+      status.textContent = "Done (with error message in JSON).";
+    } else {
+      status.textContent = "Done.";
+    }
+  } catch (e) {
+    status.textContent = "Failed: " + (e?.message || e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>
+"""
 
 # =========================================================
 # 1) GLOBAL CONFIGURATION

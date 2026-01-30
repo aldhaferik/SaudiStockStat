@@ -397,7 +397,29 @@ def get_fundamentals(ticker: str) -> Dict[str, Any]:
     cached = cache_get(cache_key)
     if cached:
         return cached
+    try:
+    def fetch_fundamentals_from_gsheets(ticker: str) -> dict:
+        r = requests.get(GOOGLE_SHEETS_URL, timeout=20)
+        r.raise_for_status()
+        data = r.json()
 
+    def pick_latest(rows):
+        if not rows:
+            return None
+        return max(rows, key=lambda x: int(x.get("year", 0)))
+
+    income = pick_latest([r for r in data.get("income", []) if str(r.get("ticker")) == ticker])
+    balance = pick_latest([r for r in data.get("balance", []) if str(r.get("ticker")) == ticker])
+    cashflow = pick_latest([r for r in data.get("cashflow", []) if str(r.get("ticker")) == ticker])
+
+    if not any([income, balance, cashflow]):
+        return {}
+
+    return {
+        "income": income,
+        "balance": balance,
+        "cashflow": cashflow,
+    }
     warnings = []
     data = {}
     try:
@@ -410,12 +432,71 @@ def get_fundamentals(ticker: str) -> Dict[str, Any]:
     cache_set(cache_key, payload)
     return payload
 
+GOOGLE_SHEETS_URL = "https://script.google.com/macros/s/AKfycbwY55bQa_0eermHnHT2UjfVG4tRDP4E2sghPPDnVMn7d5GAGFlO03mkFlAE5VpoEzQ/exec"
+
+def fetch_fundamentals_from_gsheets(ticker: str) -> dict:
+    r = requests.get(GOOGLE_SHEETS_URL, params={"ticker": ticker}, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    return data
+
 
 # =========================================================
 # 5) MULTIPLES ENGINE
 # =========================================================
 def extract_key_info(fund: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Priority:
+    1) Google Sheets (tadawul_google_sheets)
+    2) Yahoo Finance (fallback)
+    """
+
+    out = {}
+
+    # -------- 1) GOOGLE SHEETS (PRIMARY) --------
+    if fund.get("source") == "tadawul_google_sheets":
+        income = fund.get("income", [])
+        balance = fund.get("balance", [])
+        cashflow = fund.get("cashflow", [])
+
+        if income:
+            last = income[-1]
+            out["totalRevenue"] = last.get("revenue")
+            out["ebitda"] = last.get("ebitda")
+            out["operatingIncome"] = last.get("operating_income")
+            out["netIncome"] = last.get("net_income")
+
+        if balance:
+            last = balance[-1]
+            out["totalAssets"] = last.get("total_assets")
+            out["totalLiabilities"] = last.get("total_liabilities")
+            out["equity"] = last.get("equity")
+            out["netDebt"] = last.get("net_debt")
+
+        if cashflow:
+            last = cashflow[-1]
+            out["operatingCashFlow"] = last.get("operating_cf")
+            out["capex"] = last.get("capex")
+            out["freeCashFlow"] = last.get("free_cf")
+
+        return out  # ⬅️ STOP HERE if Sheets exists
+
+    # -------- 2) YAHOO FALLBACK --------
     info = (fund.get("fundamentals", {}) or {}).get("info", {}) or {}
+
+    keys = [
+        "marketCap", "enterpriseValue", "sharesOutstanding",
+        "trailingPE", "forwardPE", "priceToBook",
+        "totalRevenue", "ebitda",
+        "grossMargins", "operatingMargins", "profitMargins",
+        "beta", "currency", "shortName", "longName", "sector", "industry",
+    ]
+
+    for k in keys:
+        out[k] = info.get(k)
+
+    return out
+
     # Values often available in yfinance info
     keys = [
         "marketCap", "enterpriseValue", "sharesOutstanding",
@@ -543,6 +624,32 @@ class DCFInputs:
 
 def dcf_inputs_from_fundamentals(fund_payload: Dict[str, Any], multiples: Dict[str, Any]) -> Tuple[DCFInputs, List[str]]:
     warnings = []
+    src = fund_payload.get("fundamentals", {})
+    income = src.get("income", [])
+    balance = src.get("balance", [])
+    cashflow = src.get("cashflow", [])
+    fcf = None
+    if cashflow:
+        # use latest row
+        fcf = safe_float(cashflow[-1].get("free_cf"))
+        if fcf is None:
+            warnings.append("free_cf missing in Google Sheets cashflow tab.")
+
+    if fcf is None:
+        warnings.append("DCF unavailable: Free Cash Flow missing from Sheets.")
+    
+    revenue = None
+    ebit_margin = None
+
+    if income:
+        last = income[-1]
+        revenue = safe_float(last.get("revenue"))
+        ebitda = safe_float(last.get("ebitda"))
+        operating_income = safe_float(last.get("operating_income"))
+
+        if revenue and operating_income:
+            ebit_margin = operating_income / revenue
+
     key = extract_key_info(fund_payload)
 
     revenue = safe_float(key.get("totalRevenue"))
@@ -551,9 +658,20 @@ def dcf_inputs_from_fundamentals(fund_payload: Dict[str, Any], multiples: Dict[s
     op_margin = safe_float(key.get("operatingMargins"))
     ebit_margin = op_margin
 
-    # Net debt approximation: EV - MarketCap (only if both present)
+    ## Net debt: prefer Sheets balance.net_debt, else fallback EV - MarketCap
     ev = safe_float(key.get("enterpriseValue"))
     mcap = safe_float(key.get("marketCap"))
+
+    net_debt = None
+    if balance:
+        b = balance[-1]
+        net_debt = safe_float(b.get("net_debt"))
+
+    if net_debt is None and ev is not None and mcap is not None:
+       net_debt = ev - mcap
+
+    shares = safe_float(multiples.get("shares_outstanding"))
+
     net_debt = None
     if ev is not None and mcap is not None:
         net_debt = ev - mcap
@@ -577,29 +695,29 @@ def dcf_inputs_from_fundamentals(fund_payload: Dict[str, Any], multiples: Dict[s
     # WACC likewise; without a clean Saudi rf/ERP feed, treat as parameter distribution (disclosed).
     warnings.append("WACC components (rf/ERP/country risk) are not reliably available for free; WACC is modeled as a parameter distribution (disclosed).")
 
-    inp = DCFInputs(
+        inp = DCFInputs(
         revenue=revenue,
         ebit_margin=ebit_margin,
         tax_rate=TAX_RATE_DEFAULT,
-        reinvestment_rate=reinvestment_rate,
+        reinvestment_rate=None,
         wacc=WACC_DEFAULT,
         forecast_years=DCF_FORECAST_YEARS,
         terminal_growth=TERMINAL_GROWTH_DEFAULT,
         net_debt=net_debt,
-        shares_outstanding=shares if shares is not None else SHARES_OUTSTANDING_FALLBACK,
+        shares_outstanding=shares,
 
-        # Distributions (these are modeling priors; user can override via query later)
-        revenue_growth_mu=0.06,
-        revenue_growth_sigma=0.05,
+        revenue_growth_mu=0.05,
+        revenue_growth_sigma=0.04,
         ebit_margin_mu=(ebit_margin if ebit_margin is not None else 0.15),
         ebit_margin_sigma=0.05,
-        reinvest_mu=0.35,
+        reinvest_mu=0.30,
         reinvest_sigma=0.15,
         wacc_mu=WACC_DEFAULT,
         wacc_sigma=0.03,
         terminal_g_mu=TERMINAL_GROWTH_DEFAULT,
         terminal_g_sigma=0.01,
     )
+
     return inp, warnings
 
 def dcf_monte_carlo(inputs: DCFInputs, n: int = 2000, seed: int = 7) -> Dict[str, Any]:
@@ -644,6 +762,7 @@ def dcf_monte_carlo(inputs: DCFInputs, n: int = 2000, seed: int = 7) -> Dict[str
 
     N = inputs.forecast_years
     rev0 = float(inputs.revenue)
+    fcf0 = float(fcf)
     tax = float(inputs.tax_rate)
     net_debt = float(inputs.net_debt) if inputs.net_debt is not None else 0.0
     shares = float(inputs.shares_outstanding)
@@ -663,15 +782,11 @@ def dcf_monte_carlo(inputs: DCFInputs, n: int = 2000, seed: int = 7) -> Dict[str
         pv = 0.0
         fcff_N = None
 
-        for t in range(1, N + 1):
-            rev = rev * (1.0 + g[i])
-            ebit = rev * m[i]
-            nopat = ebit * (1.0 - tax)
-            reinv = nopat * r[i]
-            fcff = nopat - reinv
-            pv += fcff / ((1.0 + wi) ** t)
-            if t == N:
-                fcff_N = fcff
+for t in range(1, N + 1):
+    fcff = fcf0 * ((1.0 + g[i]) ** t)
+    pv += fcff / ((1.0 + wi) ** t)
+    if t == N:
+        fcff_N = fcff
 
         terminal = (fcff_N * (1.0 + tgi)) / (wi - tgi)
         ev = pv + terminal / ((1.0 + wi) ** N)

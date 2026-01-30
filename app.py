@@ -398,12 +398,12 @@ def get_fundamentals(ticker: str) -> Dict[str, Any]:
     if cached:
         return cached
     try:
-    def fetch_fundamentals_from_gsheets(ticker: str) -> dict:
+        def fetch_fundamentals_from_gsheets(ticker: str) -> dict:
         r = requests.get(GOOGLE_SHEETS_URL, timeout=20)
         r.raise_for_status()
         data = r.json()
 
-    def pick_latest(rows):
+        def pick_latest(rows):
         if not rows:
             return None
         return max(rows, key=lambda x: int(x.get("year", 0)))
@@ -651,6 +651,11 @@ def dcf_inputs_from_fundamentals(fund_payload: Dict[str, Any], multiples: Dict[s
             ebit_margin = operating_income / revenue
 
     key = extract_key_info(fund_payload)
+    cashflow = (fund_payload.get("fundamentals", {}) or {}).get("cashflow", [])
+    fcf0 = None
+    if cashflow and isinstance(cashflow, list):
+        f = cashflow[-1]
+        fcf0 = safe_float(f.get("free_cf"))
 
     revenue = safe_float(key.get("totalRevenue"))
     ebitda = safe_float(key.get("ebitda"))
@@ -658,23 +663,26 @@ def dcf_inputs_from_fundamentals(fund_payload: Dict[str, Any], multiples: Dict[s
     op_margin = safe_float(key.get("operatingMargins"))
     ebit_margin = op_margin
 
-    ## Net debt: prefer Sheets balance.net_debt, else fallback EV - MarketCap
+    # Net debt: prefer balance sheet net_debt (Sheets), else EV - MarketCap
     ev = safe_float(key.get("enterpriseValue"))
     mcap = safe_float(key.get("marketCap"))
 
     net_debt = None
-    if balance:
+
+    # 1) from Sheets balance (preferred)
+    if balance and len(balance) > 0:
         b = balance[-1]
         net_debt = safe_float(b.get("net_debt"))
 
+    # 2) fallback from feed EV - MarketCap
     if net_debt is None and ev is not None and mcap is not None:
-       net_debt = ev - mcap
+        net_debt = ev - mcap
+
+    # 3) final fallback 
+    if net_debt is None:
+        net_debt = 0.0
 
     shares = safe_float(multiples.get("shares_outstanding"))
-
-    net_debt = None
-    if ev is not None and mcap is not None:
-        net_debt = ev - mcap
 
     shares = safe_float(key.get("sharesOutstanding"))
     if shares is None and multiples.get("shares_outstanding") is not None:
@@ -1491,6 +1499,15 @@ def analyze(
        )
     except Exception as e:
         peer_block = {"available": False, "warnings": [str(e)]}
+    multiples = compute_multiples_from_info(current_price, key_info)
+
+    company_multiples = {...}
+
+    try:
+        peers_df = load_peer_multiples_csv()
+        peer_block = compute_peer_multiples_zscores(...)
+    except Exception as e:
+        peer_block = {"available": False, "warnings": [str(e)]}
 
     # DCF
     dcf_inputs, dcf_warnings = dcf_inputs_from_fundamentals(fund_payload, multiples
@@ -1512,6 +1529,7 @@ def analyze(
     audit = {
         "ticker": ticker,
         "asof_utc": utc_now_iso(),
+        "peer_multiples": peer_block,
         "market_snapshot": {
             "last_date": current_date,
             "last_price": current_price,

@@ -1302,7 +1302,7 @@ document.getElementById("btn").addEventListener("click", run);
 </body>
 </html>
     """
-    @app.get("/ui", response_class=HTMLResponse)
+@app.get("/ui", response_class=HTMLResponse)
 def ui():
     return home()
 @app.get("/prices")

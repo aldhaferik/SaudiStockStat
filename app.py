@@ -1,84 +1,28 @@
+# app.py
 from __future__ import annotations
-import sklearn
-import os, math, random
-from datetime import datetime
+
+import os
+import json
+import math
+import time
+import sqlite3
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any, List, Tuple
+
 import numpy as np
 import pandas as pd
 import requests
-from fastapi import FastAPI, Request
+
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
-import numpy as np
-import pandas as pd
-import requests
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.get("/", response_class=HTMLResponse)
-async def read_root():
-    return """<html><body><h2>Saudi Valuator Pro is running.</h2><p>Use the UI here: <a href='/ui'>/ui</a></p><p>Docs: <a href='/docs'>/docs</a></p></body></html>"""
-
-# ==========================
-# PART 2: Settings & Constants
-# ==========================
-DEFAULT_HISTORY_PERIOD = "5y"
-TRADING_DAYS = 252
-BETA_LOOKBACK_DAYS = TRADING_DAYS * 2
-MARKET_RETURN_LOOKBACK_DAYS = TRADING_DAYS * 5
-FORECAST_YEARS = 5
-SPREAD_HORIZON_DAYS = 21
-
-TASI_TICKER = "^TASI.SR"
-ALPHA_VANTAGE_KEY = "0LR5JLOBSLOA6Z0A"
-TWELVE_DATA_KEY = "ed240f406bab4225ac6e0a98be553aa2"
-RISK_FREE_XLSX_PATH = "saudi_yields.xlsx"
-RISK_FREE_COLUMN_NAME = "10-Year government bond yield"
-
-# ==========================
-# PART 3: Helpers & Utilities
-# ==========================
-def json_safe(obj):
-    if obj is None: return None
-    if isinstance(obj, (np.floating, np.integer)): return obj.item()
-    if isinstance(obj, float): return float(obj) if np.isfinite(obj) else None
-    if isinstance(obj, dict): return {k: json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)): return [json_safe(v) for v in obj]
-    return obj
-# =========================================================
-# Saudi Valuator Pro — PART 1
-# Foundation, Configuration, and Utilities
-# =========================================================
-
 
 
 # =========================================================
-# 0) APP + ROUTES + CORS
+# 0) APP + CORS
 # =========================================================
-
-app = FastAPI()
-
-@app.get("/", response_class=HTMLResponse)
-async def read_root():
-    return """
-    <html><body>
-    <h2>Saudi Valuator Pro is running.</h2>
-    <p>Use the UI: <a href='/docs'>/docs</a></p>
-    </body></html>
-    """
-
-@app.get("/health")
-def health():
-    return {"ok": True}
+app = FastAPI(title="Saudi Valuator Pro", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -89,917 +33,1076 @@ app.add_middleware(
 )
 
 # =========================================================
-# 1) GLOBAL CONFIGURATION
+# 1) CONFIG
 # =========================================================
-
-DEFAULT_HISTORY_PERIOD = "5y"
+DEFAULT_HISTORY_PERIOD = "10y"     # used for Yahoo fallback requests
+DEFAULT_INTERVAL = "1d"
 TRADING_DAYS = 252
-BETA_LOOKBACK_DAYS = TRADING_DAYS * 2
-MARKET_RETURN_LOOKBACK_DAYS = TRADING_DAYS * 5
-TRAIN_WINDOW_DAYS = TRADING_DAYS * 3
-TEST_WINDOW_DAYS = TRADING_DAYS * 1
 
-SOLVER_SAMPLE_STEP = 5
-N_WEIGHT_SAMPLES = 6000
-FORECAST_YEARS = 5
-SPREAD_HORIZON_DAYS = 21  # ~1 month
+# Your keys (also read env vars if set)
+ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "0LR5JLOBSLOA6Z0A")
+TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY", "ed240f406bab4225ac6e0a98be553aa2")
 
-TASI_TICKER = "^TASI.SR"
+# Caching
+CACHE_DB_PATH = os.getenv("SVP_CACHE_DB", "svp_cache.sqlite3")
+CACHE_TTL_SECONDS = int(os.getenv("SVP_CACHE_TTL_SECONDS", str(6 * 3600)))  # 6 hours default
 
-ALPHA_VANTAGE_KEY = "0LR5JLOBSLOA6Z0A"
-TWELVE_DATA_KEY = "ed240f406bab4225ac6e0a98be553aa2"
-RISK_FREE_XLSX_PATH = "saudi_yields.xlsx"
-RISK_FREE_COLUMN_NAME = "10-Year government bond yield"
+# Backtest / prediction defaults
+PREDICTION_HORIZON_DAYS_DEFAULT = 63  # ~3 months
+MIN_TRAIN_DAYS = 600                 # require enough history for walk-forward
+WALK_FORWARD_TEST_STEP = 21          # monthly-ish
+FEATURE_LOOKBACKS = [5, 21, 63, 126] # days
 
-GROWTH_MIN = -0.20
-GROWTH_MAX = 0.40
-WACC_MAX = 0.50
+# DCF defaults (used ONLY when inputs are missing; always disclosed)
+DCF_FORECAST_YEARS = 5
+TERMINAL_GROWTH_DEFAULT = 0.03       # disclosed; can be overridden
+TAX_RATE_DEFAULT = 0.20              # disclosed; can be overridden
+WACC_DEFAULT = 0.10                  # disclosed; can be overridden
+SHARES_OUTSTANDING_FALLBACK = None   # if missing, DCF per-share may be impossible
+
 
 # =========================================================
-# 2) JSON-SAFE SERIALIZATION
+# 2) SQLITE CACHE (RAW + PARSED SNAPSHOTS)
 # =========================================================
+def _db() -> sqlite3.Connection:
+    con = sqlite3.connect(CACHE_DB_PATH)
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cache (
+            cache_key TEXT PRIMARY KEY,
+            created_utc INTEGER NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+        """
+    )
+    return con
 
-def json_safe(obj):
-    if obj is None:
-        return None
-    if isinstance(obj, (np.floating, np.integer)):
-        return obj.item()
-    if isinstance(obj, float):
-        if not np.isfinite(obj):
+def cache_get(cache_key: str, ttl_seconds: int = CACHE_TTL_SECONDS) -> Optional[Dict[str, Any]]:
+    con = _db()
+    try:
+        row = con.execute("SELECT created_utc, payload_json FROM cache WHERE cache_key = ?", (cache_key,)).fetchone()
+        if not row:
             return None
-        return float(obj)
-    if isinstance(obj, dict):
-        return {k: json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [json_safe(v) for v in obj]
-    return obj
+        created_utc, payload_json = row
+        if int(time.time()) - int(created_utc) > ttl_seconds:
+            return None
+        return json.loads(payload_json)
+    finally:
+        con.close()
+
+def cache_set(cache_key: str, payload: Dict[str, Any]) -> None:
+    con = _db()
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO cache(cache_key, created_utc, payload_json) VALUES(?,?,?)",
+            (cache_key, int(time.time()), json.dumps(payload, default=str)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
 
 # =========================================================
-# 3) BASIC HELPERS
+# 3) UTILITIES
 # =========================================================
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def _to_float(x) -> Optional[float]:
+def safe_float(x) -> Optional[float]:
     try:
         if x is None:
             return None
+        if isinstance(x, (int, float, np.integer, np.floating)):
+            if np.isnan(x):
+                return None
+            return float(x)
+        s = str(x).strip()
+        if s.lower() in ("nan", "none", "", "null"):
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+def to_jsonable(x):
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, (np.floating,)):
         v = float(x)
-        if not np.isfinite(v):
-            return None
-        return v
-    except Exception:
-        return None
+        return None if np.isnan(v) else v
+    if isinstance(x, (pd.Timestamp, datetime)):
+        return x.isoformat()
+    if isinstance(x, pd.Series):
+        return x.to_dict()
+    if isinstance(x, pd.DataFrame):
+        return x.to_dict(orient="records")
+    return x
 
-def safe_div(a: float, b: float) -> Optional[float]:
-    try:
-        if b == 0 or not np.isfinite(a) or not np.isfinite(b):
-            return None
-        return a / b
-    except Exception:
-        return None
-
-def winsorize(arr: np.ndarray, p_low=0.05, p_high=0.95) -> np.ndarray:
-    arr = arr.astype(float)
-    mask = np.isfinite(arr)
-    if mask.sum() == 0:
-        return arr
-    lo = np.quantile(arr[mask], p_low)
-    hi = np.quantile(arr[mask], p_high)
-    return np.clip(arr, lo, hi)
-
-def last_value_on_or_before(series: pd.Series, dates: pd.DatetimeIndex) -> pd.Series:
-    if series is None or series.empty:
-        return pd.Series(index=dates, dtype=float)
-    s = series.copy()
-    s.index = pd.to_datetime(s.index).tz_localize(None)
-    dates = pd.to_datetime(dates).tz_localize(None)
-    tmp = s.reindex(s.index.union(dates)).sort_index().ffill()
-    return tmp.reindex(dates)
-
-def ttm_from_quarters(q_series: pd.Series) -> pd.Series:
-    s = q_series.copy()
-    s.index = pd.to_datetime(s.index).tz_localize(None)
-    return s.sort_index().rolling(4, min_periods=4).sum()
-    # =========================================================
-# app.py — PART 2
-# Models, error handling, and company loader
-# =========================================================
-
-class AnalyzeRequest(BaseModel):
-    ticker: str
-    as_of_date: Optional[str] = None  # format YYYY-MM-DD
-    forecast_years: Optional[int] = FORECAST_YEARS
-    force_refresh: Optional[bool] = False
-
-
-class ValuationError(Exception):
-    def __init__(self, message: str, code: int = 400):
-        self.message = message
-        self.code = code
-        super().__init__(message)
-
-
-@app.exception_handler(ValuationError)
-async def valuation_exception_handler(request, exc: ValuationError):
-    return JSONResponse(
-        status_code=exc.code,
-        content={"error": exc.message}
-    )
-
-
-def fetch_company_profile(ticker: str) -> dict:
+def df_clean_prices(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Basic company info: name, sector, etc.
+    Standardize to columns: date, open, high, low, close, adj_close, volume
+    Ensure date is UTC-normalized, sorted, no duplicates.
     """
-    url = f"https://www.alphavantage.co/query"
-    params = {
-        "function": "OVERVIEW",
-        "symbol": ticker,
-        "apikey": ALPHA_VANTAGE_KEY
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "adj_close", "volume"])
+    d = df.copy()
+    if "Date" in d.columns:
+        d = d.rename(columns={"Date": "date"})
+    if "date" not in d.columns:
+        d = d.reset_index().rename(columns={"index": "date"})
+    d["date"] = pd.to_datetime(d["date"], utc=True, errors="coerce")
+    d = d.dropna(subset=["date"]).sort_values("date")
+    d = d.drop_duplicates(subset=["date"], keep="last")
+
+    rename_map = {
+        "Open": "open", "High": "high", "Low": "low", "Close": "close",
+        "Adj Close": "adj_close", "AdjClose": "adj_close", "Volume": "volume",
+        "open": "open", "high": "high", "low": "low", "close": "close",
+        "adj_close": "adj_close", "volume": "volume",
     }
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        data = resp.json()
-        if "Name" not in data:
-            raise ValuationError(f"Invalid or unsupported ticker: {ticker}")
-        return {
-            "name": data.get("Name"),
-            "sector": data.get("Sector"),
-            "industry": data.get("Industry"),
-            "description": data.get("Description"),
-            "exchange": data.get("Exchange"),
-        }
-    except Exception as e:
-        raise ValuationError(f"Failed to fetch company profile: {e}")
-        # =========================================================
-# app.py — PART 3
-# Price History, Market Return, Risk-Free Curve
+    d = d.rename(columns=rename_map)
+    for c in ["open", "high", "low", "close", "adj_close", "volume"]:
+        if c not in d.columns:
+            d[c] = np.nan
+
+    d = d[["date", "open", "high", "low", "close", "adj_close", "volume"]].copy()
+
+    # If adj_close missing but close exists, use close
+    if d["adj_close"].isna().all() and not d["close"].isna().all():
+        d["adj_close"] = d["close"]
+
+    return d.reset_index(drop=True)
+
+def log_return(series: pd.Series) -> pd.Series:
+    s = series.astype(float)
+    return np.log(s / s.shift(1))
+
+def robust_zscore(x: pd.Series) -> pd.Series:
+    med = x.median(skipna=True)
+    mad = (x - med).abs().median(skipna=True)
+    if mad is None or mad == 0 or np.isnan(mad):
+        return (x - x.mean(skipna=True)) / (x.std(skipna=True) + 1e-12)
+    return (x - med) / (1.4826 * mad + 1e-12)
+
+
 # =========================================================
-
-import yfinance as yf
-import openpyxl
-
-
-def get_price_history_yf(ticker: str, period: str = DEFAULT_HISTORY_PERIOD) -> pd.Series:
+# 4) DATA LOADERS (YAHOO primary, TwelveData/AlphaVantage fallback)
+# =========================================================
+def fetch_prices_yahoo(ticker: str, period: str = DEFAULT_HISTORY_PERIOD, interval: str = DEFAULT_INTERVAL) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Fallback method: uses Yahoo Finance API via yfinance.
+    Uses yfinance (installed via requirements). If not available, raises ImportError.
     """
-    try:
-        df = yf.download(ticker, period=period, progress=False)
-        if df.empty:
-            raise ValuationError(f"No historical data found for {ticker} via Yahoo Finance")
-        return df["Adj Close"]
-    except Exception as e:
-        raise ValuationError(f"Failed to fetch Yahoo Finance prices for {ticker}: {e}")
+    import yfinance as yf  # local import
 
+    t = yf.Ticker(ticker)
+    hist = t.history(period=period, interval=interval, auto_adjust=False, actions=True)
+    meta = {"source": "yahoo", "period": period, "interval": interval}
+    if hist is None or hist.empty:
+        return pd.DataFrame(), meta
+    hist = hist.reset_index()
+    return df_clean_prices(hist), meta
 
-def get_price_history_alpha(ticker: str) -> pd.Series:
+def fetch_prices_twelvedata(ticker: str, start: Optional[str] = None, end: Optional[str] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Primary source for price history using Alpha Vantage.
+    Twelve Data time_series endpoint.
     """
-    url = f"https://www.alphavantage.co/query"
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": ticker,
+        "interval": "1day",
+        "apikey": TWELVE_DATA_KEY,
+        "format": "JSON",
+        "outputsize": 5000,
+    }
+    if start:
+        params["start_date"] = start
+    if end:
+        params["end_date"] = end
+
+    r = requests.get(url, params=params, timeout=30)
+    meta = {"source": "twelvedata", "http_status": r.status_code}
+    if r.status_code != 200:
+        return pd.DataFrame(), {**meta, "error": r.text[:500]}
+    j = r.json()
+    if "values" not in j or not isinstance(j["values"], list):
+        return pd.DataFrame(), {**meta, "error": j}
+    rows = []
+    for v in j["values"]:
+        rows.append(
+            {
+                "date": v.get("datetime"),
+                "open": safe_float(v.get("open")),
+                "high": safe_float(v.get("high")),
+                "low": safe_float(v.get("low")),
+                "close": safe_float(v.get("close")),
+                "adj_close": safe_float(v.get("close")),
+                "volume": safe_float(v.get("volume")),
+            }
+        )
+    df = pd.DataFrame(rows)
+    return df_clean_prices(df), meta
+
+def fetch_prices_alphavantage(ticker: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Alpha Vantage TIME_SERIES_DAILY_ADJUSTED.
+    """
+    url = "https://www.alphavantage.co/query"
     params = {
         "function": "TIME_SERIES_DAILY_ADJUSTED",
         "symbol": ticker,
         "apikey": ALPHA_VANTAGE_KEY,
-        "outputsize": "full"
+        "outputsize": "full",
     }
+    r = requests.get(url, params=params, timeout=30)
+    meta = {"source": "alphavantage", "http_status": r.status_code}
+    if r.status_code != 200:
+        return pd.DataFrame(), {**meta, "error": r.text[:500]}
+    j = r.json()
+    ts = j.get("Time Series (Daily)")
+    if not isinstance(ts, dict):
+        return pd.DataFrame(), {**meta, "error": j}
+    rows = []
+    for dt_str, v in ts.items():
+        rows.append(
+            {
+                "date": dt_str,
+                "open": safe_float(v.get("1. open")),
+                "high": safe_float(v.get("2. high")),
+                "low": safe_float(v.get("3. low")),
+                "close": safe_float(v.get("4. close")),
+                "adj_close": safe_float(v.get("5. adjusted close")),
+                "volume": safe_float(v.get("6. volume")),
+            }
+        )
+    df = pd.DataFrame(rows)
+    return df_clean_prices(df), meta
+
+def get_prices_with_fallback(ticker: str) -> Dict[str, Any]:
+    """
+    Returns:
+      {
+        "prices": [ ... ],
+        "meta": {...},
+        "quality": {...},
+        "warnings": [...]
+      }
+    """
+    cache_key = f"prices::{ticker}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
+    warnings: List[str] = []
+    sources_tried: List[Dict[str, Any]] = []
+
+    # 1) Yahoo
+    df = pd.DataFrame()
+    meta = {}
     try:
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json().get("Time Series (Daily)", {})
-        if not data:
-            raise ValuationError(f"No data from Alpha Vantage for {ticker}")
-
-        records = [(datetime.strptime(k, "%Y-%m-%d"), float(v["5. adjusted close"]))
-                   for k, v in data.items()]
-        records.sort()
-        return pd.Series(dict(records))
+        df, meta = fetch_prices_yahoo(ticker)
+        sources_tried.append(meta)
     except Exception as e:
-        raise ValuationError(f"Error fetching Alpha Vantage data: {e}")
+        warnings.append(f"Yahoo fetch failed: {type(e).__name__}: {str(e)[:200]}")
+        sources_tried.append({"source": "yahoo", "error": f"{type(e).__name__}: {str(e)[:200]}"})
 
-
-def load_risk_free_curve() -> pd.Series:
-    """
-    Loads Saudi 10-Year Government Bond Yield from Excel.
-    """
-    try:
-        df = pd.read_excel(RISK_FREE_XLSX_PATH)
-        df.columns = df.columns.str.strip()
-        df["date"] = pd.to_datetime(df["date"])
-        df.set_index("date", inplace=True)
-        series = df[RISK_FREE_COLUMN_NAME].dropna().astype(float)
-        return series
-    except Exception as e:
-        raise ValuationError(f"Failed to load Saudi risk-free yield curve: {e}")
-
-
-def get_market_index_history() -> pd.Series:
-    """
-    History of the benchmark market index (TASI).
-    """
-    return get_price_history_yf(TASI_TICKER, period=DEFAULT_HISTORY_PERIOD)
-    # =========================================================
-# app.py — PART 4
-# Company Financials, TTM Aggregation, Multiples Prep
-# =========================================================
-
-def extract_ttm(fin: pd.DataFrame, keys: List[str]) -> Dict[str, float]:
-    """
-    Extract trailing-twelve-month values for key fields from quarterly financials.
-    """
-    result = {}
-    for key in keys:
-        series = fin.get(key)
-        if series is None or series.dropna().empty:
-            result[key] = None
+    # If Yahoo empty -> Twelve Data
+    if df.empty:
+        df2, meta2 = fetch_prices_twelvedata(ticker)
+        sources_tried.append(meta2)
+        if not df2.empty:
+            df = df2
+            meta = meta2
         else:
-            series = pd.to_numeric(series, errors='coerce').dropna()
-            if len(series) >= 4:
-                result[key] = series.iloc[-4:].sum()
-            else:
-                result[key] = series.sum()
-    return result
+            warnings.append("Twelve Data returned empty or error.")
 
+    # If still empty -> Alpha Vantage
+    if df.empty:
+        df3, meta3 = fetch_prices_alphavantage(ticker)
+        sources_tried.append(meta3)
+        if not df3.empty:
+            df = df3
+            meta = meta3
+        else:
+            warnings.append("Alpha Vantage returned empty or error.")
 
-def compute_multiples(fin_data: Dict[str, Any]) -> Dict[str, Optional[float]]:
-    """
-    Computes valuation multiples from provided financial data.
-    """
-    price = _to_float(fin_data.get("price"))
-    shares = _to_float(fin_data.get("shares_outstanding"))
-    market_cap = None if price is None or shares is None else price * shares
-
-    eps = _to_float(fin_data.get("eps"))
-    sales = _to_float(fin_data.get("revenue"))
-    book_value = _to_float(fin_data.get("book_value"))
-    ebitda = _to_float(fin_data.get("ebitda"))
-
-    return {
-        "PE": safe_div(market_cap, eps * shares if eps is not None and shares else None),
-        "PS": safe_div(market_cap, sales),
-        "PB": safe_div(market_cap, book_value),
-        "EV_EBITDA": safe_div(market_cap, ebitda)
+    # Quality checks
+    quality = {
+        "n_rows": int(len(df)),
+        "start": (df["date"].min().isoformat() if not df.empty else None),
+        "end": (df["date"].max().isoformat() if not df.empty else None),
+        "missing_adj_close_pct": (float(df["adj_close"].isna().mean()) if not df.empty else 1.0),
+        "missing_volume_pct": (float(df["volume"].isna().mean()) if not df.empty else 1.0),
     }
 
-
-def sanity_check_metrics(metrics: Dict[str, Optional[float]]) -> Dict[str, Optional[float]]:
-    """
-    Enforces realistic valuation range to flag anomalies.
-    """
-    clean = {}
-    for k, v in metrics.items():
-        if v is None or not np.isfinite(v):
-            clean[k] = None
-        elif v < 0 or v > 1000:  # Hard floor/ceiling
-            clean[k] = None
-        else:
-            clean[k] = round(float(v), 2)
-    return clean
-
-
-class ValuationError(Exception):
-    """Custom error for valuation pipeline"""
-    pass
-    # =========================================================
-# app.py — PART 5
-# DCF Forecasting & Valuation Logic
-# =========================================================
-
-def project_cash_flows(
-    base_fcf: float,
-    growth_rate: float,
-    forecast_years: int = FORECAST_YEARS
-) -> List[float]:
-    """
-    Project future Free Cash Flows (FCF) using constant growth.
-    """
-    if not np.isfinite(base_fcf) or not np.isfinite(growth_rate):
-        return []
-    return [base_fcf * ((1 + growth_rate) ** year) for year in range(1, forecast_years + 1)]
-
-
-def compute_terminal_value(
-    last_fcf: float,
-    terminal_growth: float,
-    wacc: float
-) -> Optional[float]:
-    """
-    Calculates Terminal Value using Gordon Growth Model.
-    """
-    if not np.isfinite(last_fcf) or not np.isfinite(terminal_growth) or not np.isfinite(wacc):
-        return None
-    if terminal_growth >= wacc:
-        return None
-    return last_fcf * (1 + terminal_growth) / (wacc - terminal_growth)
-
-
-def discount_values(
-    cash_flows: List[float],
-    terminal_value: Optional[float],
-    wacc: float
-) -> float:
-    """
-    Discount future FCFs and terminal value to present value.
-    """
-    if not np.isfinite(wacc):
-        return float("nan")
-
-    pv = sum(cf / ((1 + wacc) ** (i + 1)) for i, cf in enumerate(cash_flows))
-    if terminal_value is not None:
-        pv += terminal_value / ((1 + wacc) ** len(cash_flows))
-    return pv
-
-
-def compute_intrinsic_value_per_share(
-    fcf: float,
-    growth: float,
-    terminal_growth: float,
-    wacc: float,
-    shares_outstanding: float
-) -> Optional[float]:
-    """
-    Full DCF pipeline to intrinsic value per share.
-    """
-    wacc = min(wacc, WACC_MAX)  # hard cap
-    fcf_projection = project_cash_flows(fcf, growth)
-    tv = compute_terminal_value(fcf_projection[-1], terminal_growth, wacc)
-    pv_total = discount_values(fcf_projection, tv, wacc)
-
-    if shares_outstanding <= 0:
-        return None
-    return pv_total / shares_outstanding
-
-
-def classify_valuation(current_price: float, intrinsic_value: float) -> str:
-    """
-    Classifies stock as undervalued, fair, or overvalued.
-    """
-    if not all(np.isfinite(x) for x in [current_price, intrinsic_value]):
-        return "Uncertain"
-
-    if intrinsic_value > current_price * 1.2:
-        return "Undervalued"
-    elif intrinsic_value < current_price * 0.8:
-        return "Overvalued"
-    else:
-        return "Fairly Valued"
-        # =========================================================
-# app.py — PART 6
-# Analyzer Endpoint (/analyze)
-# =========================================================
-
-class AnalyzeRequest(BaseModel):
-    ticker: str
-
-
-@app.post("/analyze")
-async def analyze_stock(req: AnalyzeRequest):
-    ticker = req.ticker.upper()
-
-    try:
-        # Load company financials
-        fin = load_fundamentals(ticker)
-        if fin is None or fin.fcf.isnull().all():
-            return JSONResponse(status_code=400, content={"error": "Missing financial data"})
-
-        # Estimate risk-free rate
-        rf = get_risk_free_rate() / 100.0
-
-        # Compute Beta (if prices available)
-        beta = estimate_beta(ticker)
-        if not np.isfinite(beta):
-            return JSONResponse(status_code=400, content={"error": "Could not compute Beta"})
-
-        # Market return and cost of equity
-        market_return = estimate_market_return()
-        cost_of_equity = rf + beta * (market_return - rf)
-
-        # Capital structure from balance sheet
-        debt, equity = fin.latest_debt_equity()
-        cost_of_debt = estimate_cost_of_debt(ticker)
-        tax_rate = estimate_effective_tax_rate(fin)
-
-        wacc = calculate_wacc(
-            cost_of_equity=cost_of_equity,
-            cost_of_debt=cost_of_debt,
-            equity_value=equity,
-            debt_value=debt,
-            tax_rate=tax_rate,
-        )
-
-        # Intrinsic Value
-        latest_fcf = fin.latest_fcf()
-        shares = fin.latest_shares_outstanding()
-        growth = fin.estimate_growth()
-        terminal_growth = DEFAULT_TERMINAL_GROWTH
-
-        dcf_value = compute_intrinsic_value_per_share(
-            fcf=latest_fcf,
-            growth=growth,
-            terminal_growth=terminal_growth,
-            wacc=wacc,
-            shares_outstanding=shares
-        )
-
-        # Multiples valuation
-        mult_df, _ = compute_historical_multiples(fin, fin.prices)
-        mult_value = estimate_value_from_multiples(mult_df, fin)
-
-        # Market price
-        current_price = get_current_price(ticker)
-
-        result = {
-            "ticker": ticker,
-            "inputs": {
-                "fcf": latest_fcf,
-                "growth": growth,
-                "terminal_growth": terminal_growth,
-                "wacc": wacc,
-                "shares": shares,
-                "beta": beta,
-                "rf": rf,
-                "market_return": market_return
-            },
-            "valuation": {
-                "dcf_per_share": dcf_value,
-                "multiples_estimate": mult_value,
-                "market_price": current_price,
-                "classification": classify_valuation(current_price, dcf_value),
-            },
-        }
-
-        return JSONResponse(content=result)
-
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# 7) PRICE FORECASTER ENDPOINT (PURE STATISTICAL MODEL)
-
-from sklearn.linear_model import RidgeCV
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import train_test_split
-
-@app.post("/forecast")
-async def forecast_price(req: ValuationRequest):
-    import yfinance as yf
-
-    ticker = req.ticker
-    data = yf.download(f"{ticker}.SR", period="5y")
-    if data.empty:
-        raise HTTPException(status_code=404, detail="Ticker data not found.")
-
-    df = data[["Close"]].copy()
-    df["Return"] = df["Close"].pct_change()
-    df["MA20"] = df["Close"].rolling(20).mean()
-    df["MA50"] = df["Close"].rolling(50).mean()
-    df["Volatility"] = df["Return"].rolling(20).std()
-    df = df.dropna()
-
-    df["Target"] = df["Close"].shift(-21)  # Predict 1-month ahead (~21 trading days)
-    df = df.dropna()
-
-    X = df[["Close", "Return", "MA20", "MA50", "Volatility"]]
-    y = df["Target"]
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, shuffle=False, test_size=0.2)
-
-    model = GradientBoostingRegressor(n_estimators=100, max_depth=4)
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    rmse = round(mean_squared_error(y_test, y_pred, squared=False), 2)
-    latest_price = round(df["Close"].iloc[-1], 2)
-    forecast_price = round(model.predict(X.iloc[[-1]])[0], 2)
-
-    return {
+    payload = {
+        "asof_utc": utc_now_iso(),
         "ticker": ticker,
-        "latest_price": latest_price,
-        "forecast_price_1mo": forecast_price,
-        "rmse": rmse,
-        "model": "GradientBoosting (pure statistical)",
-        "features_used": ["Close", "Return", "MA20", "MA50", "Volatility"]
+        "meta": {"selected_source": meta, "sources_tried": sources_tried},
+        "quality": quality,
+        "warnings": warnings,
+        "prices": [ {k: to_jsonable(v) for k, v in row.items()} for row in df.to_dict(orient="records") ],
+    }
+    cache_set(cache_key, payload)
+    return payload
+
+def fetch_fundamentals_yahoo(ticker: str) -> Dict[str, Any]:
+    """
+    Uses yfinance fundamentals. For many Tadawul tickers, data may be partial.
+    We do NOT invent. Missing stays missing.
+    """
+    import yfinance as yf  # local import
+
+    t = yf.Ticker(ticker)
+
+    info = {}
+    try:
+        info = t.info or {}
+    except Exception:
+        info = {}
+
+    def df_to_records(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return []
+        d = df.copy()
+        # yfinance returns columns as dates
+        d.columns = [str(c) for c in d.columns]
+        d.index = [str(i) for i in d.index]
+        d = d.reset_index().rename(columns={"index": "line_item"})
+        return json.loads(d.to_json(orient="records"))
+
+    fin = {}
+    try:
+        fin = {
+            "financials": df_to_records(t.financials),
+            "balance_sheet": df_to_records(t.balance_sheet),
+            "cashflow": df_to_records(t.cashflow),
+            "income_stmt": df_to_records(getattr(t, "income_stmt", None)),
+            "quarterly_financials": df_to_records(getattr(t, "quarterly_financials", None)),
+            "quarterly_balance_sheet": df_to_records(getattr(t, "quarterly_balance_sheet", None)),
+            "quarterly_cashflow": df_to_records(getattr(t, "quarterly_cashflow", None)),
+        }
+    except Exception:
+        fin = {k: [] for k in ["financials","balance_sheet","cashflow","income_stmt","quarterly_financials","quarterly_balance_sheet","quarterly_cashflow"]}
+
+    out = {
+        "source": "yahoo",
+        "ticker": ticker,
+        "asof_utc": utc_now_iso(),
+        "info": info,
+        "statements": fin,
+    }
+    return out
+
+def get_fundamentals(ticker: str) -> Dict[str, Any]:
+    cache_key = f"fundamentals::{ticker}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
+    warnings = []
+    data = {}
+    try:
+        data = fetch_fundamentals_yahoo(ticker)
+    except Exception as e:
+        warnings.append(f"Fundamentals fetch failed: {type(e).__name__}: {str(e)[:200]}")
+        data = {"source": "yahoo", "ticker": ticker, "asof_utc": utc_now_iso(), "info": {}, "statements": {}}
+
+    payload = {"asof_utc": utc_now_iso(), "ticker": ticker, "warnings": warnings, "fundamentals": data}
+    cache_set(cache_key, payload)
+    return payload
+
+
+# =========================================================
+# 5) MULTIPLES ENGINE
+# =========================================================
+def extract_key_info(fund: Dict[str, Any]) -> Dict[str, Any]:
+    info = (fund.get("fundamentals", {}) or {}).get("info", {}) or {}
+    # Values often available in yfinance info
+    keys = [
+        "marketCap", "enterpriseValue", "sharesOutstanding",
+        "trailingPE", "forwardPE", "priceToBook",
+        "totalRevenue", "ebitda", "grossMargins", "operatingMargins", "profitMargins",
+        "beta", "currency", "shortName", "longName", "sector", "industry",
+    ]
+    out = {}
+    for k in keys:
+        out[k] = info.get(k, None)
+    return out
+
+def compute_multiples_from_info(price: float, key_info: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Computes multiples using available fields (no invention).
+    """
+    mcap = safe_float(key_info.get("marketCap"))
+    ev = safe_float(key_info.get("enterpriseValue"))
+    shares = safe_float(key_info.get("sharesOutstanding"))
+    revenue = safe_float(key_info.get("totalRevenue"))
+    ebitda = safe_float(key_info.get("ebitda"))
+    pb = safe_float(key_info.get("priceToBook"))
+    tpe = safe_float(key_info.get("trailingPE"))
+    fpe = safe_float(key_info.get("forwardPE"))
+
+    out = {
+        "price": price,
+        "market_cap": mcap,
+        "enterprise_value": ev,
+        "shares_outstanding": shares,
+        "trailing_pe": tpe,
+        "forward_pe": fpe,
+        "price_to_book": pb,
+        "ev_to_ebitda": None,
+        "price_to_sales": None,
     }
 
-# =========================================================
-# app.py — PART 7
-# Interactive UI Page (/ui)
-# =========================================================
+    if ev is not None and ebitda is not None and ebitda != 0:
+        out["ev_to_ebitda"] = ev / ebitda
+    if mcap is not None and revenue is not None and revenue != 0:
+        out["price_to_sales"] = mcap / revenue
 
-@app.get("/ui", response_class=HTMLResponse)
-async def ui_page():
+    return out
+
+
+# =========================================================
+# 6) DCF ENGINE (FCFF) WITH FULL DISCLOSURE OF ASSUMPTIONS
+# =========================================================
+@dataclass
+class DCFInputs:
+    # Core
+    revenue: Optional[float]
+    ebit_margin: Optional[float]
+    tax_rate: float
+    reinvestment_rate: Optional[float]   # fraction of after-tax EBIT reinvested
+    wacc: float
+    forecast_years: int
+    terminal_growth: float
+    net_debt: Optional[float]
+    shares_outstanding: Optional[float]
+
+    # Modeling distributions / ranges (optional; used for Monte Carlo)
+    revenue_growth_mu: float
+    revenue_growth_sigma: float
+    ebit_margin_mu: float
+    ebit_margin_sigma: float
+    reinvest_mu: float
+    reinvest_sigma: float
+    wacc_mu: float
+    wacc_sigma: float
+    terminal_g_mu: float
+    terminal_g_sigma: float
+
+def dcf_inputs_from_fundamentals(fund_payload: Dict[str, Any], multiples: Dict[str, Any]) -> Tuple[DCFInputs, List[str]]:
+    warnings = []
+    key = extract_key_info(fund_payload)
+
+    revenue = safe_float(key.get("totalRevenue"))
+    ebitda = safe_float(key.get("ebitda"))
+    # EBIT margin often missing; approximate EBIT margin from operatingMargins if exists (not fabricated, it is an info field)
+    op_margin = safe_float(key.get("operatingMargins"))
+    ebit_margin = op_margin
+
+    # Net debt approximation: EV - MarketCap (only if both present)
+    ev = safe_float(key.get("enterpriseValue"))
+    mcap = safe_float(key.get("marketCap"))
+    net_debt = None
+    if ev is not None and mcap is not None:
+        net_debt = ev - mcap
+
+    shares = safe_float(key.get("sharesOutstanding"))
+    if shares is None and multiples.get("shares_outstanding") is not None:
+        shares = safe_float(multiples.get("shares_outstanding"))
+
+    # If revenue missing, DCF can’t run meaningfully
+    if revenue is None:
+        warnings.append("DCF missing revenue (totalRevenue not available from free feed). DCF may be unavailable.")
+
+    # If EBIT margin missing, we can’t compute after-tax EBIT reliably
+    if ebit_margin is None:
+        warnings.append("DCF missing operating margin (operatingMargins not available). DCF may be unreliable/unavailable.")
+
+    # Reinvestment rate is not reliably available from free feeds; treat as parameter with disclosure.
+    reinvestment_rate = None
+    warnings.append("Reinvestment rate is not reliably available from free feeds; modeled as a parameter distribution (disclosed).")
+
+    # WACC likewise; without a clean Saudi rf/ERP feed, treat as parameter distribution (disclosed).
+    warnings.append("WACC components (rf/ERP/country risk) are not reliably available for free; WACC is modeled as a parameter distribution (disclosed).")
+
+    inp = DCFInputs(
+        revenue=revenue,
+        ebit_margin=ebit_margin,
+        tax_rate=TAX_RATE_DEFAULT,
+        reinvestment_rate=reinvestment_rate,
+        wacc=WACC_DEFAULT,
+        forecast_years=DCF_FORECAST_YEARS,
+        terminal_growth=TERMINAL_GROWTH_DEFAULT,
+        net_debt=net_debt,
+        shares_outstanding=shares if shares is not None else SHARES_OUTSTANDING_FALLBACK,
+
+        # Distributions (these are modeling priors; user can override via query later)
+        revenue_growth_mu=0.06,
+        revenue_growth_sigma=0.05,
+        ebit_margin_mu=(ebit_margin if ebit_margin is not None else 0.15),
+        ebit_margin_sigma=0.05,
+        reinvest_mu=0.35,
+        reinvest_sigma=0.15,
+        wacc_mu=WACC_DEFAULT,
+        wacc_sigma=0.03,
+        terminal_g_mu=TERMINAL_GROWTH_DEFAULT,
+        terminal_g_sigma=0.01,
+    )
+    return inp, warnings
+
+def dcf_monte_carlo(inputs: DCFInputs, n: int = 2000, seed: int = 7) -> Dict[str, Any]:
+    """
+    FCFF DCF:
+      EBIT = Revenue * EBIT_margin
+      NOPAT = EBIT*(1-tax)
+      Reinvestment = NOPAT*reinvestment_rate
+      FCFF = NOPAT - Reinvestment
+      PV = sum(FCFF_t / (1+WACC)^t) + Terminal / (1+WACC)^N
+      Terminal = FCFF_N*(1+g) / (WACC - g)  (requires WACC>g)
+      Equity = EV - net_debt (net_debt can be negative)
+      Intrinsic per share = Equity / shares
+    """
+    out = {"available": True, "warnings": [], "assumptions": asdict(inputs)}
+
+    if inputs.revenue is None or inputs.ebit_margin is None:
+        out["available"] = False
+        out["warnings"].append("DCF not available because revenue or EBIT margin is missing from the free data feed.")
+        return out
+
+    if inputs.shares_outstanding is None or inputs.shares_outstanding == 0:
+        out["available"] = False
+        out["warnings"].append("DCF not available per-share because shares outstanding is missing from the free data feed.")
+        return out
+
+    rng = np.random.default_rng(seed)
+
+    # Sample parameters
+    g = rng.normal(inputs.revenue_growth_mu, inputs.revenue_growth_sigma, size=n)
+    m = rng.normal(inputs.ebit_margin_mu, inputs.ebit_margin_sigma, size=n)
+    r = rng.normal(inputs.reinvest_mu, inputs.reinvest_sigma, size=n)
+    w = rng.normal(inputs.wacc_mu, inputs.wacc_sigma, size=n)
+    tg = rng.normal(inputs.terminal_g_mu, inputs.terminal_g_sigma, size=n)
+
+    # Clip to sensible bounds (these are mathematical constraints, not “shortcuts”)
+    g = np.clip(g, -0.20, 0.25)
+    m = np.clip(m, -0.10, 0.60)
+    r = np.clip(r, 0.00, 0.90)
+    w = np.clip(w, 0.02, 0.25)
+    tg = np.clip(tg, -0.01, 0.06)
+
+    N = inputs.forecast_years
+    rev0 = float(inputs.revenue)
+    tax = float(inputs.tax_rate)
+    net_debt = float(inputs.net_debt) if inputs.net_debt is not None else 0.0
+    shares = float(inputs.shares_outstanding)
+
+    per_share_vals = np.full(n, np.nan, dtype=float)
+    ev_vals = np.full(n, np.nan, dtype=float)
+    bad_terminal = 0
+
+    for i in range(n):
+        wi = w[i]
+        tgi = tg[i]
+        if wi <= tgi + 1e-6:
+            bad_terminal += 1
+            continue
+
+        rev = rev0
+        pv = 0.0
+        fcff_N = None
+
+        for t in range(1, N + 1):
+            rev = rev * (1.0 + g[i])
+            ebit = rev * m[i]
+            nopat = ebit * (1.0 - tax)
+            reinv = nopat * r[i]
+            fcff = nopat - reinv
+            pv += fcff / ((1.0 + wi) ** t)
+            if t == N:
+                fcff_N = fcff
+
+        terminal = (fcff_N * (1.0 + tgi)) / (wi - tgi)
+        ev = pv + terminal / ((1.0 + wi) ** N)
+        equity = ev - net_debt
+        per_share = equity / shares
+        ev_vals[i] = ev
+        per_share_vals[i] = per_share
+
+    valid = np.isfinite(per_share_vals)
+    if valid.sum() < max(50, int(0.05 * n)):
+        out["available"] = False
+        out["warnings"].append("DCF sampling produced too few valid terminal values (WACC <= g in many draws).")
+        out["warnings"].append(f"Invalid terminal draws: {bad_terminal}/{n}")
+        return out
+
+    vals = per_share_vals[valid]
+    out["warnings"].append(f"Invalid terminal draws filtered: {bad_terminal}/{n}")
+    out["distribution"] = {
+        "n": int(valid.sum()),
+        "p05": float(np.nanpercentile(vals, 5)),
+        "p25": float(np.nanpercentile(vals, 25)),
+        "p50": float(np.nanpercentile(vals, 50)),
+        "p75": float(np.nanpercentile(vals, 75)),
+        "p95": float(np.nanpercentile(vals, 95)),
+        "mean": float(np.nanmean(vals)),
+        "std": float(np.nanstd(vals)),
+    }
+    # Keep a small sample for audit (not the full 2000 to avoid huge payloads)
+    sample_idx = np.linspace(0, len(vals) - 1, num=min(200, len(vals))).astype(int)
+    out["sample_values_per_share"] = [float(vals[j]) for j in sample_idx]
+    return out
+
+
+# =========================================================
+# 7) PREDICTION ENGINE (WALK-FORWARD, BASELINE + REGULARIZED MODEL)
+# =========================================================
+def build_features(prices_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Features computed strictly from price/volume (always available if price data exists).
+    No leakage: features at time t use data <= t only.
+    """
+    d = prices_df.copy()
+    d = d.sort_values("date").reset_index(drop=True)
+    px = d["adj_close"].astype(float)
+
+    d["ret_1"] = log_return(px)
+    d["ret_5"] = log_return(px).rolling(5).sum()
+    d["ret_21"] = log_return(px).rolling(21).sum()
+
+    d["vol_21"] = d["ret_1"].rolling(21).std()
+    d["vol_63"] = d["ret_1"].rolling(63).std()
+
+    d["ma_21"] = px.rolling(21).mean()
+    d["ma_63"] = px.rolling(63).mean()
+    d["ma_gap_21"] = (px / d["ma_21"]) - 1.0
+    d["ma_gap_63"] = (px / d["ma_63"]) - 1.0
+
+    # Volume features
+    vol = d["volume"].astype(float)
+    d["vol_z_63"] = robust_zscore(vol.rolling(63).mean())
+
+    # RSI-like (simple)
+    delta = px.diff()
+    up = delta.clip(lower=0).rolling(14).mean()
+    down = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = up / (down + 1e-12)
+    d["rsi_14"] = 100 - (100 / (1 + rs))
+
+    # Clean
+    feature_cols = ["ret_1", "ret_5", "ret_21", "vol_21", "vol_63", "ma_gap_21", "ma_gap_63", "vol_z_63", "rsi_14"]
+    d[feature_cols] = d[feature_cols].replace([np.inf, -np.inf], np.nan)
+    return d
+
+def walk_forward_backtest(prices_df: pd.DataFrame, horizon_days: int = PREDICTION_HORIZON_DAYS_DEFAULT) -> Dict[str, Any]:
+    """
+    Predict future horizon return: log(P_{t+h}/P_t).
+    Models:
+      - Baseline: predict 0 (random walk in log-return space)
+      - Ridge regression on engineered features
+    Strict walk-forward evaluation.
+    """
+    out = {"available": True, "warnings": [], "horizon_days": int(horizon_days)}
+
+    if prices_df is None or prices_df.empty or len(prices_df) < MIN_TRAIN_DAYS:
+        out["available"] = False
+        out["warnings"].append(f"Not enough price history for backtest. Need >= {MIN_TRAIN_DAYS} rows.")
+        out["n_rows"] = int(0 if prices_df is None else len(prices_df))
+        return out
+
+    try:
+        from sklearn.linear_model import Ridge
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.pipeline import Pipeline
+        from sklearn.metrics import mean_absolute_error, mean_squared_error
+    except Exception as e:
+        out["available"] = False
+        out["warnings"].append("scikit-learn is required for the prediction engine. Install it via requirements.txt.")
+        out["warnings"].append(f"Import error: {type(e).__name__}: {str(e)[:200]}")
+        return out
+
+    d = build_features(prices_df)
+    d = d.dropna(subset=["adj_close"]).copy()
+    d = d.sort_values("date").reset_index(drop=True)
+
+    px = d["adj_close"].astype(float)
+    future = np.log(px.shift(-horizon_days) / px)
+    d["target_h"] = future
+
+    feature_cols = ["ret_1", "ret_5", "ret_21", "vol_21", "vol_63", "ma_gap_21", "ma_gap_63", "vol_z_63", "rsi_14"]
+    d_model = d.dropna(subset=feature_cols + ["target_h"]).copy()
+    if len(d_model) < MIN_TRAIN_DAYS // 2:
+        out["available"] = False
+        out["warnings"].append("After feature/target alignment, too few rows remain for backtest.")
+        out["n_rows_effective"] = int(len(d_model))
+        return out
+
+    X = d_model[feature_cols].values
+    y = d_model["target_h"].values
+    dates = d_model["date"].tolist()
+
+    # Walk-forward splits
+    n = len(d_model)
+    start_train = max(0, n - (TRADING_DAYS * 3))  # keep enough training; still walk-forward
+    train_end = max(MIN_TRAIN_DAYS, start_train)
+
+    preds_baseline = []
+    preds_ridge = []
+    actuals = []
+    eval_dates = []
+
+    model = Pipeline([
+        ("scaler", StandardScaler(with_mean=True, with_std=True)),
+        ("ridge", Ridge(alpha=5.0, random_state=0)),
+    ])
+
+    step = WALK_FORWARD_TEST_STEP
+    # Ensure we don't run into target leakage; d_model already aligned properly.
+    for test_start in range(train_end, n - 1, step):
+        train_X = X[:test_start]
+        train_y = y[:test_start]
+
+        test_end = min(test_start + step, n)
+        test_X = X[test_start:test_end]
+        test_y = y[test_start:test_end]
+
+        if len(train_y) < MIN_TRAIN_DAYS:
+            continue
+
+        model.fit(train_X, train_y)
+
+        pred_r = model.predict(test_X)
+        pred_b = np.zeros_like(test_y)  # baseline = 0 expected log-return
+
+        preds_ridge.extend(pred_r.tolist())
+        preds_baseline.extend(pred_b.tolist())
+        actuals.extend(test_y.tolist())
+        eval_dates.extend(dates[test_start:test_end])
+
+    if len(actuals) < 30:
+        out["available"] = False
+        out["warnings"].append("Backtest produced too few evaluation points. Increase history or reduce constraints.")
+        out["n_eval"] = int(len(actuals))
+        return out
+
+    actuals = np.array(actuals, dtype=float)
+    preds_ridge = np.array(preds_ridge, dtype=float)
+    preds_baseline = np.array(preds_baseline, dtype=float)
+
+    def metrics(pred: np.ndarray, act: np.ndarray) -> Dict[str, Any]:
+        mae = float(np.mean(np.abs(pred - act)))
+        rmse = float(np.sqrt(np.mean((pred - act) ** 2)))
+        da = float(np.mean((pred > 0) == (act > 0)))
+        return {"mae": mae, "rmse": rmse, "directional_accuracy": da}
+
+    out["n_eval"] = int(len(actuals))
+    out["metrics_baseline"] = metrics(preds_baseline, actuals)
+    out["metrics_ridge"] = metrics(preds_ridge, actuals)
+
+    # Calibration-ish: bucket predicted returns and compare realized sign frequency
+    bins = [-np.inf, -0.10, -0.03, 0.0, 0.03, 0.10, np.inf]
+    labels = ["<=-10%", "(-10,-3]%", "(-3,0]%", "(0,3]%", "(3,10]%", ">10%"]
+    b = pd.cut(preds_ridge, bins=bins, labels=labels)
+    calib = []
+    for lab in labels:
+        mask = (b == lab)
+        if mask.sum() < 10:
+            continue
+        frac_up = float(np.mean(actuals[mask] > 0))
+        calib.append({"bucket": lab, "n": int(mask.sum()), "frac_actual_up": frac_up})
+    out["calibration_ridge"] = calib
+
+    # Keep last trained model inputs for forward prediction
+    out["_feature_cols"] = feature_cols
+    out["_d_model_tail"] = {
+        "last_date": d_model["date"].iloc[-1].isoformat(),
+        "last_price": float(d_model["adj_close"].iloc[-1]),
+    }
+    return out
+
+def forecast_next(prices_df: pd.DataFrame, horizon_days: int) -> Dict[str, Any]:
+    """
+    Fit ridge on all available data and forecast next horizon log-return distribution proxy:
+      - Point forecast from ridge
+      - Error bands using historical residual std from backtest
+    """
+    res = {"available": True, "warnings": [], "horizon_days": int(horizon_days)}
+
+    bt = walk_forward_backtest(prices_df, horizon_days=horizon_days)
+    if not bt.get("available", False):
+        res["available"] = False
+        res["warnings"].append("Forecast unavailable because backtest is unavailable.")
+        res["backtest"] = bt
+        return res
+
+    try:
+        from sklearn.linear_model import Ridge
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.pipeline import Pipeline
+    except Exception as e:
+        res["available"] = False
+        res["warnings"].append("scikit-learn required for forecasting.")
+        res["warnings"].append(f"Import error: {type(e).__name__}: {str(e)[:200]}")
+        return res
+
+    d = build_features(prices_df).dropna().copy()
+    d = d.sort_values("date").reset_index(drop=True)
+
+    px = d["adj_close"].astype(float)
+    target = np.log(px.shift(-horizon_days) / px)
+    d["target_h"] = target
+    feature_cols = bt["_feature_cols"]
+
+    d_model = d.dropna(subset=feature_cols + ["target_h"]).copy()
+    if d_model.empty:
+        res["available"] = False
+        res["warnings"].append("Forecast unavailable after alignment (no rows).")
+        return res
+
+    X = d_model[feature_cols].values
+    y = d_model["target_h"].values
+
+    model = Pipeline([
+        ("scaler", StandardScaler(with_mean=True, with_std=True)),
+        ("ridge", Ridge(alpha=5.0, random_state=0)),
+    ])
+    model.fit(X, y)
+
+    # Predict from the latest feature row
+    last_row = d[feature_cols].iloc[[-1]].values
+    pred_logret = float(model.predict(last_row)[0])
+
+    # Use ridge RMSE from backtest as an error proxy
+    rmse = safe_float(bt["metrics_ridge"].get("rmse"))
+    if rmse is None:
+        rmse = 0.10
+
+    # Convert to price forecast distribution bands
+    last_price = float(d["adj_close"].iloc[-1])
+    p50 = last_price * float(np.exp(pred_logret))
+    p16 = last_price * float(np.exp(pred_logret - rmse))
+    p84 = last_price * float(np.exp(pred_logret + rmse))
+
+    res["last_date"] = d["date"].iloc[-1].isoformat()
+    res["last_price"] = last_price
+    res["predicted_log_return"] = pred_logret
+    res["error_proxy_rmse"] = float(rmse)
+    res["forecast_price_bands"] = {"p16": float(p16), "p50": float(p50), "p84": float(p84)}
+    res["backtest_summary"] = {
+        "n_eval": bt.get("n_eval"),
+        "metrics_baseline": bt.get("metrics_baseline"),
+        "metrics_ridge": bt.get("metrics_ridge"),
+        "calibration_ridge": bt.get("calibration_ridge", []),
+    }
+    return res
+
+
+# =========================================================
+# 8) DECISION LAYER
+# =========================================================
+def valuation_label(current_price: float, dcf: Dict[str, Any], multiples: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Decision logic is transparent and conservative.
+    If DCF missing -> rely more on multiples, but disclose lower confidence.
+    """
+    out = {"label": "insufficient_data", "confidence": "low", "reasons": []}
+
+    # Multiples sanity flags (no peer comp set here; only own multiples from info)
+    pe = safe_float(multiples.get("trailing_pe"))
+    pb = safe_float(multiples.get("price_to_book"))
+    ev_ebitda = safe_float(multiples.get("ev_to_ebitda"))
+
+    # DCF-based signal
+    if dcf.get("available") and "distribution" in dcf:
+        p25 = safe_float(dcf["distribution"].get("p25"))
+        p75 = safe_float(dcf["distribution"].get("p75"))
+        p50 = safe_float(dcf["distribution"].get("p50"))
+        if p25 is not None and p75 is not None and p50 is not None:
+            if current_price < 0.85 * p25:
+                out["label"] = "undervalued"
+                out["confidence"] = "medium"
+                out["reasons"].append(f"Market price is below 85% of DCF P25 (conservative intrinsic band).")
+            elif current_price > 1.15 * p75:
+                out["label"] = "overvalued"
+                out["confidence"] = "medium"
+                out["reasons"].append(f"Market price is above 115% of DCF P75 (conservative intrinsic band).")
+            else:
+                out["label"] = "fair_value_zone"
+                out["confidence"] = "medium"
+                out["reasons"].append("Market price lies within the conservative DCF band (P25–P75).")
+
+            out["reasons"].append(f"DCF P50 vs price: P50={p50:.4g}, Price={current_price:.4g}")
+
+    else:
+        out["reasons"].append("DCF not available from free fundamentals; label relies on limited multiples/price-only signals.")
+        out["confidence"] = "low"
+
+    # Add multiples context (not decisive without peer set)
+    if pe is not None:
+        out["reasons"].append(f"Trailing P/E (from feed): {pe:.3g}")
+    if pb is not None:
+        out["reasons"].append(f"Price/Book (from feed): {pb:.3g}")
+    if ev_ebitda is not None:
+        out["reasons"].append(f"EV/EBITDA (computed from feed): {ev_ebitda:.3g}")
+
+    return out
+
+
+# =========================================================
+# 9) API ENDPOINTS
+# =========================================================
+@app.get("/", response_class=HTMLResponse)
+def home():
     return """
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html>
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Saudi Valuator Pro</title>
   <style>
-    body {
-      font-family: -apple-system, system-ui, Segoe UI, Roboto, Arial, sans-serif;
-      margin: 24px;
-      background: #f9fafb;
-      color: #1f2937;
-    }
-    .container {
-      max-width: 880px;
-      margin: auto;
-      padding: 24px;
-      background: #fff;
-      border-radius: 12px;
-      box-shadow: 0 4px 16px rgba(0,0,0,0.05);
-    }
-    input {
-      padding: 12px;
-      width: 200px;
-      font-size: 1rem;
-      border: 1px solid #d1d5db;
-      border-radius: 8px;
-      margin-right: 10px;
-    }
-    button {
-      padding: 12px 16px;
-      background: #0a68b8;
-      color: #fff;
-      border: none;
-      border-radius: 8px;
-      font-size: 1rem;
-      cursor: pointer;
-    }
-    #result {
-      margin-top: 30px;
-      white-space: pre-wrap;
-      background: #f3f4f6;
-      padding: 16px;
-      border-radius: 8px;
-      font-size: 14px;
-    }
+    body { font-family: -apple-system, system-ui, Segoe UI, Roboto, Arial; margin: 24px; color:#111; }
+    .card { border:1px solid #e5e5e5; border-radius:14px; padding:16px; margin:12px 0; }
+    input { padding:10px 12px; border-radius:10px; border:1px solid #ccc; width: 240px; }
+    button { padding:10px 12px; border-radius:10px; border:0; background:#111; color:#fff; cursor:pointer; }
+    pre { background:#0b0b0b; color:#eaeaea; padding:12px; border-radius:12px; overflow:auto; }
+    .muted { color:#555; font-size: 13px; }
   </style>
 </head>
 <body>
-  <div class="container">
-    <h2>Saudi Valuator Pro</h2>
-    <p>Enter Saudi ticker (e.g., 2222, 4002, 1211):</p>
-    <input id="tickerInput" placeholder="e.g. 2222" />
-    <button onclick="analyze()">Analyze</button>
-    <div id="result"></div>
+  <h2>Saudi Valuator Pro</h2>
+  <div class="card">
+    <div class="muted">Enter a Tadawul ticker like <b>2222.SR</b>. This UI calls <code>/analyze</code>.</div>
+    <div style="margin-top:10px;">
+      <input id="ticker" value="2222.SR" />
+      <input id="horizon" value="63" style="width:100px;margin-left:6px;" />
+      <button onclick="run()">Analyze</button>
+    </div>
   </div>
-
-  <script>
-    async function analyze() {
-      const ticker = document.getElementById("tickerInput").value;
-      const resultEl = document.getElementById("result");
-      resultEl.innerText = "Analyzing " + ticker + "...";
-
-      const res = await fetch("/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ticker })
-      });
-
-      if (!res.ok) {
-        const err = await res.json();
-        resultEl.innerText = "Error: " + (err.error || JSON.stringify(err));
-        return;
-      }
-
-      const json = await res.json();
-      resultEl.innerText = JSON.stringify(json, null, 2);
-    }
-  </script>
+  <div class="card">
+    <div class="muted">Output (full audit JSON):</div>
+    <pre id="out">{}</pre>
+  </div>
+<script>
+async function run(){
+  const t = document.getElementById('ticker').value.trim();
+  const h = document.getElementById('horizon').value.trim();
+  const url = `/analyze?ticker=${encodeURIComponent(t)}&horizon_days=${encodeURIComponent(h)}`;
+  document.getElementById('out').textContent = "Loading...";
+  const r = await fetch(url);
+  const j = await r.json();
+  document.getElementById('out').textContent = JSON.stringify(j, null, 2);
+}
+</script>
 </body>
 </html>
 """
-    # =========================================================
-# app.py — PART 8
-# Final Launch Wrap-Up + Trace View of Model Inputs & Outputs
-# =========================================================
 
-@app.get("/health", response_class=JSONResponse)
-async def health():
-    return {"status": "ok", "message": "Saudi Valuator Pro is alive"}
+@app.get("/prices")
+def prices(ticker: str = Query(..., description="e.g., 2222.SR")):
+    payload = get_prices_with_fallback(ticker)
+    return JSONResponse(payload)
 
-@app.get("/train-test-info", response_class=JSONResponse)
-async def train_test_info():
-    """
-    Endpoint to show what data (and from where) was used for model training and testing
-    """
-    try:
-        summary = {
-            "fundamentals_source": "Tadawul filings scraped via TradingView + manual .xlsx uploads",
-            "price_source": "Yahoo Finance via yfinance or fallback to TwelveData API",
-            "macro_input_source": "User-provided Excel: saudi_yields.xlsx (10y RF)",
-            "valuation_model_inputs": [
-                "EPS (TTM)",
-                "Book Value / Share",
-                "EBITDA Margin",
-                "Free Cash Flow (5yr average)",
-                "Beta (TASI-relative)",
-                "Sector-average multiples"
-            ],
-            "model_training_range": "2018–2023 (sliding 5y windows)",
-            "model_testing_range": "OOS backtest over 3M, 6M, 1Y",
-            "data_alignment": "Quarter-matched between financial statements & market prices",
-            "valuation_methods": [
-                "FCFF DCF (WACC from macro + beta)",
-                "Relative Multiples (P/E, EV/EBITDA, P/B)",
-                "Monte Carlo Sensitivity for terminal value"
-            ],
-            "model_accuracy_ranges": {
-                "low_error_range": "±4%",
-                "acceptable_range": "±8%",
-                "failures": "Flagged when error >15% in backtest"
-            },
-        }
-        return summary
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-        # =========================================================
-# 9) FUNDAMENTALS LOADING + ESTIMATION HELPERS
-#    - Used by DCF and Multiples models
-#    - Pulls local .xlsx, parses fundamentals, calculates Rf, β, etc.
-# =========================================================
+@app.get("/fundamentals")
+def fundamentals(ticker: str = Query(..., description="e.g., 2222.SR")):
+    payload = get_fundamentals(ticker)
+    return JSONResponse(payload)
 
-def load_fundamentals(ticker: str, fundamentals_path: str = "fundamentals") -> dict:
-    """
-    Load fundamental data from pre-downloaded Excel files.
-    Files should be in a directory like: fundamentals/2222.xlsx
-    """
-    file_path = os.path.join(fundamentals_path, f"{ticker}.xlsx")
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Missing financials file: {file_path}")
+@app.get("/backtest")
+def backtest(
+    ticker: str = Query(..., description="e.g., 2222.SR"),
+    horizon_days: int = Query(PREDICTION_HORIZON_DAYS_DEFAULT, ge=5, le=252),
+):
+    p = get_prices_with_fallback(ticker)
+    df = pd.DataFrame(p.get("prices", []))
+    df = df_clean_prices(df)
+    bt = walk_forward_backtest(df, horizon_days=horizon_days)
+    return JSONResponse({"ticker": ticker, "asof_utc": utc_now_iso(), "backtest": bt, "price_quality": p.get("quality"), "price_warnings": p.get("warnings")})
 
-    df = pd.read_excel(file_path, sheet_name=None)
-    income = df.get("Income Statement")
-    balance = df.get("Balance Sheet")
-    cashflow = df.get("Cash Flow")
+@app.get("/analyze")
+def analyze(
+    ticker: str = Query(..., description="e.g., 2222.SR"),
+    horizon_days: int = Query(PREDICTION_HORIZON_DAYS_DEFAULT, ge=5, le=252),
+    dcf_samples: int = Query(2000, ge=500, le=20000),
+):
+    # Prices
+    price_payload = get_prices_with_fallback(ticker)
+    dfp = pd.DataFrame(price_payload.get("prices", []))
+    dfp = df_clean_prices(dfp)
 
-    if income is None or balance is None or cashflow is None:
-        raise ValueError(f"Missing sheet(s) in {file_path}")
-
-    return {
-        "income": income,
-        "balance": balance,
-        "cashflow": cashflow,
-    }
-
-
-def estimate_growth(income_df: pd.DataFrame, column="Net Income") -> float:
-    """
-    Estimate forward growth rate using log regression on net income.
-    """
-    try:
-        series = income_df[column].dropna().tail(5)
-        log_vals = np.log(series.values)
-        years = np.arange(len(log_vals))
-        slope, _ = np.polyfit(years, log_vals, 1)
-        return round(np.exp(slope) - 1, 4)
-    except Exception:
-        return 0.03  # fallback 3%
-
-
-def estimate_beta(ticker: str, market_index: str = TASI_TICKER) -> float:
-    """
-    Estimate CAPM beta by regressing stock returns on TASI.
-    """
-    import yfinance as yf
-    try:
-        stock = yf.download(ticker + ".SR", period=DEFAULT_HISTORY_PERIOD)
-        index = yf.download(market_index, period=DEFAULT_HISTORY_PERIOD)
-        stock_ret = stock["Adj Close"].pct_change().dropna()
-        index_ret = index["Adj Close"].pct_change().dropna()
-        merged = pd.merge(stock_ret, index_ret, left_index=True, right_index=True, suffixes=("_stock", "_index"))
-        beta = np.cov(merged["_stock"], merged["_index"])[0, 1] / np.var(merged["_index"])
-        return round(beta, 3)
-    except Exception:
-        return 1.0  # fallback beta
-
-
-def get_risk_free_rate(bond_path: str = RISK_FREE_XLSX_PATH, column_name: str = RISK_FREE_COLUMN_NAME) -> float:
-    """
-    Extract latest risk-free rate from Saudi bond yield Excel.
-    """
-    try:
-        df = pd.read_excel(bond_path)
-        latest = df[column_name].dropna().iloc[-1]
-        return round(float(latest) / 100, 4)  # convert from % to decimal
-    except Exception:
-        return 0.05  # fallback 5%
-
-
-def get_equity_cost(rf: float, beta: float, mrp: float = 0.07) -> float:
-    """
-    CAPM cost of equity: Rf + β * MRP
-    """
-    return round(rf + beta * mrp, 4)
-
-
-def get_wacc(rf: float, beta: float, debt_cost: float, equity_ratio: float, tax_rate: float = 0.2) -> float:
-    """
-    Estimate Weighted Average Cost of Capital (WACC)
-    """
-    re = get_equity_cost(rf, beta)
-    rd = debt_cost
-    wd = 1 - equity_ratio
-    we = equity_ratio
-    wacc = we * re + wd * rd * (1 - tax_rate)
-    return round(wacc, 4)
-# =========================================================
-# 10) MULTIPLES VALUATION ENGINE
-#     - Uses: time-aligned Price / EPS, BV, EBITDA
-#     - Filters invalid entries and builds valuation bands
-# =========================================================
-
-def compute_historical_multiples(fundamentals: dict, market_prices: pd.Series) -> pd.DataFrame:
-    """
-    Construct historical valuation multiples using fundamentals and market prices.
-    Returns: DataFrame with date-aligned P/E, P/B, EV/EBITDA, etc.
-    """
-    income = fundamentals["income"]
-    balance = fundamentals["balance"]
-    cashflow = fundamentals["cashflow"]
-
-    df = pd.DataFrame(index=income.index)
-    df["EPS"] = income["Net Income"] / balance["Total Shares Outstanding"]
-    df["BVPS"] = balance["Total Equity"] / balance["Total Shares Outstanding"]
-    df["EBITDA"] = income["Operating Profit"] + income.get("Depreciation", 0)
-
-    df["Price"] = [
-        market_prices.loc[:date].iloc[-1] if not market_prices.loc[:date].empty else np.nan
-        for date in df.index
-    ]
-
-    df["P/E"] = df["Price"] / df["EPS"]
-    df["P/B"] = df["Price"] / df["BVPS"]
-    df["EV/EBITDA"] = df["Price"] / df["EBITDA"]
-
-    return df.dropna()
-
-
-def estimate_value_from_multiples(multiples_df: pd.DataFrame) -> dict:
-    """
-    Estimate value based on mean/median of historical multiples.
-    Returns: dict with fair value ranges
-    """
-    results = {}
-
-    for multiple in ["P/E", "P/B", "EV/EBITDA"]:
-        if multiple not in multiples_df.columns:
-            continue
-        mult_series = multiples_df[multiple].dropna()
-        if mult_series.empty:
-            continue
-
-        avg_mult = mult_series.mean()
-        med_mult = mult_series.median()
-        latest = multiples_df.iloc[-1]
-
-        if multiple == "P/E":
-            fair_avg = avg_mult * latest["EPS"]
-            fair_med = med_mult * latest["EPS"]
-        elif multiple == "P/B":
-            fair_avg = avg_mult * latest["BVPS"]
-            fair_med = med_mult * latest["BVPS"]
-        elif multiple == "EV/EBITDA":
-            fair_avg = avg_mult * latest["EBITDA"]
-            fair_med = med_mult * latest["EBITDA"]
-        else:
-            continue
-
-        results[multiple] = {
-            "average_multiple": round(avg_mult, 2),
-            "median_multiple": round(med_mult, 2),
-            "fair_value_avg": round(fair_avg, 2),
-            "fair_value_med": round(fair_med, 2),
-        }
-
-    return results
-
-
-def get_current_price(ticker: str) -> float:
-    """
-    Get the latest stock price from Yahoo Finance (in SAR).
-    """
-    import yfinance as yf
-    try:
-        data = yf.download(ticker + ".SR", period="5d", interval="1d")
-        price = data["Close"].iloc[-1]
-        return round(price, 2)
-    except Exception:
-        return np.nan
-# =========================================================
-# 11) FINAL VALUATION AGGREGATOR
-#     - Merge DCF + Multiples + Current Price
-#     - Classify: Undervalued / Fair / Overvalued
-# =========================================================
-
-def valuation_report(ticker: str, models: dict, price: float) -> dict:
-    """
-    Aggregate results from models (DCF, Multiples) and compare to market price.
-    Returns: full report including classification and confidence bounds.
-    """
-    dcf = models.get("dcf", {})
-    mult = models.get("multiples", {})
-    dcf_vals = []
-
-    # Collect all fair values from DCF (base, bear, bull)
-    for k in ["base", "bear", "bull"]:
-        if k in dcf:
-            dcf_vals.append(dcf[k]["value"])
-
-    # Collect all fair values from Multiples
-    for method in mult.values():
-        dcf_vals += [method.get("fair_value_avg", np.nan), method.get("fair_value_med", np.nan)]
-
-    # Remove invalid entries
-    fair_values = [v for v in dcf_vals if isinstance(v, (int, float)) and not np.isnan(v)]
-
-    if not fair_values:
-        return {"error": "No valid fair value estimates available."}
-
-    # Calculate average fair value
-    mean_fv = np.mean(fair_values)
-    std_fv = np.std(fair_values)
-
-    valuation_band = (round(mean_fv - std_fv, 2), round(mean_fv + std_fv, 2))
-
-    # Classification
-    if price < valuation_band[0]:
-        verdict = "Undervalued"
-    elif price > valuation_band[1]:
-        verdict = "Overvalued"
-    else:
-        verdict = "Fairly Valued"
-
-    return {
-        "ticker": ticker,
-        "current_price": price,
-        "valuation_mean": round(mean_fv, 2),
-        "valuation_band": valuation_band,
-        "verdict": verdict,
-        "sources_used": {
-            "DCF": list(dcf.keys()),
-            "Multiples": list(mult.keys())
-        }
-    }
-# =========================================================
-# 12) ANALYZE ROUTE (POST /analyze)
-# =========================================================
-
-class AnalyzeRequest(BaseModel):
-    ticker: str
-
-@app.post("/analyze")
-async def analyze(request: AnalyzeRequest):
-    ticker = request.ticker.upper()
-
-    try:
-        # 1. Load data
-        fin = fetch_fundamentals(ticker)
-        price = fetch_current_price(ticker)
-
-        # Validate
-        if fin.empty or np.isnan(price):
-            return JSONResponse(
-                status_code=422,
-                content={"error": "Missing data for ticker: EPS, FCFF, or current price unavailable"}
-            )
-
-        # 2. Run models
-        dcf_results = run_dcf_valuation(ticker, fin)
-        multiple_results = run_multiples_valuation(ticker, fin)
-        all_models = {
-            "dcf": dcf_results,
-            "multiples": multiple_results
-        }
-
-        # 3. Verdict
-        final_report = valuation_report(ticker, all_models, price)
-
-        # 4. Return
-        return {
-            "ticker": ticker,
-            "price": price,
-            "valuation": final_report,
-            "dcf_model": dcf_results,
-            "multiples_model": multiple_results
-        }
-
-    except Exception as e:
+    if dfp.empty:
         return JSONResponse(
-            status_code=500,
-            content={"error": f"Unhandled error: {str(e)}"}
+            {
+                "ticker": ticker,
+                "asof_utc": utc_now_iso(),
+                "errors": ["No price data available from Yahoo/TwelveData/AlphaVantage."],
+                "price_meta": price_payload.get("meta"),
+                "price_warnings": price_payload.get("warnings"),
+                "price_quality": price_payload.get("quality"),
+            },
+            status_code=400,
         )
-# =========================================================
-# 14) HEALTH CHECK + APP LAUNCH
-# =========================================================
 
-@app.get("/health", response_class=JSONResponse)
-async def health():
-    return {"status": "alive", "app": "Saudi Valuator Pro"}
+    current_price = float(dfp["adj_close"].iloc[-1])
+    current_date = dfp["date"].iloc[-1].isoformat()
 
-# Main entry point
-if __name__ == "__main__":
+    # Fundamentals
+    fund_payload = get_fundamentals(ticker)
+    key_info = extract_key_info(fund_payload)
+
+    # Multiples
+    multiples = compute_multiples_from_info(current_price, key_info)
+
+    # DCF
+    dcf_inputs, dcf_warnings = dcf_inputs_from_fundamentals(fund_payload, multiples)
+    dcf_res = dcf_monte_carlo(dcf_inputs, n=dcf_samples, seed=7)
+    if dcf_warnings:
+        dcf_res.setdefault("warnings", [])
+        dcf_res["warnings"] = list(dcf_res["warnings"]) + dcf_warnings
+
+    # Forecasting
+    forecast_res = forecast_next(dfp, horizon_days=horizon_days)
+
+    # Decision label
+    decision = valuation_label(current_price, dcf_res, multiples)
+
+    # Assemble audit pack
+    audit = {
+        "ticker": ticker,
+        "asof_utc": utc_now_iso(),
+        "market_snapshot": {
+            "last_date": current_date,
+            "last_price": current_price,
+            "currency": key_info.get("currency"),
+            "name": key_info.get("longName") or key_info.get("shortName"),
+            "sector": key_info.get("sector"),
+            "industry": key_info.get("industry"),
+        },
+        "data_quality": {
+            "prices": price_payload.get("quality"),
+            "price_warnings": price_payload.get("warnings", []),
+            "price_sources_tried": (price_payload.get("meta", {}) or {}).get("sources_tried", []),
+            "fundamentals_warnings": fund_payload.get("warnings", []),
+        },
+        "fundamentals_raw": fund_payload.get("fundamentals", {}),  # full raw snapshot for audit
+        "multiples": multiples,
+        "dcf": dcf_res,
+        "prediction": forecast_res,
+        "decision": decision,
+        "disclosures": [
+            "This app does not fabricate missing fundamentals. When free feeds do not provide required fields, DCF may be unavailable or have lower confidence.",
+            "Prediction is evaluated using walk-forward (time-series) backtesting; performance is reported versus a naive baseline.",
+            "DCF uses parameter distributions for reinvestment rate and WACC when not available from free feeds, and these assumptions are shown in the output.",
+        ],
+    }
+    return JSONResponse(audit)
+
+
+# =========================================================
+# 10) LOCAL RUN
+# =========================================================
+def app_main():
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
 
+if __name__ == "__main__":
+    app_main()

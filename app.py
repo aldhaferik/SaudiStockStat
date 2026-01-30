@@ -460,6 +460,58 @@ def compute_multiples_from_info(price: float, key_info: Dict[str, Any]) -> Dict[
 
     return out
 
+PEERS_MULTIPLES_CSV = os.environ.get("PEERS_MULTIPLES_CSV", "fundamentals/peers_multiples.csv")
+
+def load_peer_multiples_csv(path: str = PEERS_MULTIPLES_CSV) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing peer multiples file: {path}")
+    df = pd.read_csv(path)
+    df.columns = [c.strip().lower() for c in df.columns]
+    if "ticker" not in df.columns or "sector" not in df.columns:
+        raise ValueError("CSV must contain: ticker, sector")
+    for c in ["pe","pb","ps","ev_ebitda"]:
+        if c in df.columns:
+            df[c] = df[c].apply(safe_float)
+    df["ticker"] = df["ticker"].astype(str).str.strip()
+    df["sector"] = df["sector"].astype(str).str.strip()
+    return df
+
+def zscore(value: float, series: pd.Series) -> float:
+    v = safe_float(value)
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if not np.isfinite(v) or len(s) < 5:
+        return np.nan
+    sd = float(s.std(ddof=1))
+    if not np.isfinite(sd) or sd == 0:
+        return np.nan
+    return (v - float(s.mean())) / sd
+
+def compute_peer_multiples_zscores(ticker, sector, company_multiples, peers_df,
+                                   used_multiples=("pe","pb","ps","ev_ebitda")):
+    if not sector:
+        return {"available": False, "warnings": ["Missing sector"]}
+    sdf = peers_df[peers_df["sector"] == sector]
+    if sdf.empty:
+        return {"available": False, "warnings": [f"No peers for sector {sector}"]}
+    z = {}
+    used = []
+    for m in used_multiples:
+        if m in sdf.columns:
+            val = safe_float(company_multiples.get(m))
+            zv = zscore(val, sdf[m])
+            if np.isfinite(zv):
+                z[m] = float(zv)
+                used.append(m)
+    comp = np.mean(list(z.values())) if z else np.nan
+    return {
+        "available": bool(z),
+        "sector": sector,
+        "peer_count": int(len(sdf)),
+        "z_by_multiple": z,
+        "used_multiples": used,
+        "zscore_composite": None if not np.isfinite(comp) else float(comp),
+        "warnings": [],
+    }
 
 # =========================================================
 # 6) DCF ENGINE (FCFF) WITH FULL DISCLOSURE OF ASSUMPTIONS
@@ -996,7 +1048,263 @@ async function run(){
 </body>
 </html>
 """
+@app.get("/ui", response_class=HTMLResponse)
+def ui():
+    return """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Saudi Valuator Pro</title>
+  <style>
+    :root{
+      --bg:#f4f6f9; --card:#fff; --text:#0f172a; --muted:#475569;
+      --border:#e2e8f0; --shadow:0 6px 18px rgba(15,23,42,.08);
+      --good:#16a34a; --mid:#f59e0b; --bad:#dc2626; --accent:#2563eb;
+    }
+    body{margin:0;padding:24px;background:var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;color:var(--text);}
+    .wrap{max-width:1200px;margin:0 auto;}
+    h1{margin:0 0 16px 0;font-size:28px;}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);padding:16px;margin:12px 0;}
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+    input,button{font-size:14px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);outline:none}
+    input{min-width:220px}
+    button{background:var(--accent);color:#fff;border:none;cursor:pointer}
+    button:disabled{opacity:.55;cursor:not-allowed}
+    .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
+    .span4{grid-column:span 4}
+    .span6{grid-column:span 6}
+    .span12{grid-column:span 12}
+    .k{color:var(--muted);font-size:12px;margin-bottom:6px}
+    .v{font-size:18px;font-weight:650}
+    .small{font-size:12px;color:var(--muted)}
+    .badge{display:inline-flex;align-items:center;gap:8px;padding:7px 10px;border-radius:999px;border:1px solid var(--border);font-weight:650}
+    .dot{width:10px;height:10px;border-radius:999px;background:#94a3b8}
+    .good .dot{background:var(--good)} .mid .dot{background:var(--mid)} .bad .dot{background:var(--bad)}
+    .good{color:var(--good)} .mid{color:var(--mid)} .bad{color:var(--bad)}
+    details pre{white-space:pre-wrap;word-break:break-word;background:#0b1220;color:#e5e7eb;padding:14px;border-radius:12px;overflow:auto;max-height:560px}
+    .err{color:var(--bad);font-weight:650}
+    @media (max-width: 900px){
+      .span4,.span6{grid-column:span 12}
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Saudi Valuator Pro</h1>
 
+  <div class="card">
+    <div class="row">
+      <div>
+        <div class="k">Ticker (Tadawul like 2222.SR)</div>
+        <input id="ticker" value="1120.SR" />
+      </div>
+      <div>
+        <div class="k">Horizon days</div>
+        <input id="horizon" value="63" />
+      </div>
+      <div style="padding-top:18px">
+        <button id="btn">Analyze</button>
+      </div>
+      <div id="status" class="small"></div>
+    </div>
+  </div>
+
+  <div class="card" id="headline" style="display:none">
+    <div class="row" style="justify-content:space-between">
+      <div>
+        <div class="badge" id="verdictBadge"><span class="dot"></span><span id="verdictText">—</span></div>
+        <div class="small" id="metaLine" style="margin-top:8px"></div>
+      </div>
+      <div class="small" id="asof"></div>
+    </div>
+  </div>
+
+  <div class="grid" id="summaryGrid" style="display:none">
+    <div class="card span4">
+      <div class="k">Current price</div>
+      <div class="v" id="px">—</div>
+      <div class="small" id="pxMeta">—</div>
+    </div>
+
+    <div class="card span4">
+      <div class="k">DCF intrinsic (P50)</div>
+      <div class="v" id="dcfP50">—</div>
+      <div class="small" id="dcfBand">—</div>
+    </div>
+
+    <div class="card span4">
+      <div class="k">Valuation gap vs P50</div>
+      <div class="v" id="gap">—</div>
+      <div class="small" id="gapPct">—</div>
+    </div>
+
+    <div class="card span6">
+      <div class="k">Peer multiples z-score (sector)</div>
+      <div class="v" id="peerZ">—</div>
+      <div class="small" id="peerDetails">—</div>
+    </div>
+
+    <div class="card span6">
+      <div class="k">Forecast (horizon)</div>
+      <div class="v" id="fc">—</div>
+      <div class="small" id="fcBand">—</div>
+    </div>
+
+    <div class="card span12">
+      <div class="k">Notes / warnings</div>
+      <div class="small" id="warn">—</div>
+    </div>
+
+    <div class="card span12">
+      <details>
+        <summary style="cursor:pointer;font-weight:650">Full audit JSON</summary>
+        <pre id="audit"></pre>
+      </details>
+    </div>
+  </div>
+
+  <div class="card" id="errorCard" style="display:none">
+    <div class="err">Error</div>
+    <div class="small" id="errText"></div>
+  </div>
+
+</div>
+
+<script>
+function fmt(x, digits=2){
+  if (x === null || x === undefined || Number.isNaN(x)) return "—";
+  const n = Number(x);
+  if (!Number.isFinite(n)) return "—";
+  return n.toLocaleString(undefined, {maximumFractionDigits:digits, minimumFractionDigits:digits});
+}
+function fmtPct(x, digits=2){
+  if (x === null || x === undefined || Number.isNaN(x)) return "—";
+  const n = Number(x);
+  if (!Number.isFinite(n)) return "—";
+  return (n*100).toLocaleString(undefined, {maximumFractionDigits:digits, minimumFractionDigits:digits}) + "%";
+}
+function setBadge(verdict){
+  const b = document.getElementById("verdictBadge");
+  b.classList.remove("good","mid","bad");
+  if (!verdict) { b.classList.add("mid"); return; }
+  const v = verdict.toLowerCase();
+  if (v.includes("under")) b.classList.add("good");
+  else if (v.includes("over")) b.classList.add("bad");
+  else b.classList.add("mid");
+}
+
+function pick(obj, path){
+  try{
+    return path.split(".").reduce((a,k)=> (a && a[k] !== undefined) ? a[k] : undefined, obj);
+  }catch(e){ return undefined; }
+}
+
+async function run(){
+  const ticker = document.getElementById("ticker").value.trim();
+  const horizon = document.getElementById("horizon").value.trim();
+  const btn = document.getElementById("btn");
+  const status = document.getElementById("status");
+  const errorCard = document.getElementById("errorCard");
+  errorCard.style.display = "none";
+
+  btn.disabled = true;
+  status.textContent = "Running /analyze …";
+
+  try{
+    const url = `/analyze?ticker=${encodeURIComponent(ticker)}&horizon_days=${encodeURIComponent(horizon)}`;
+    const r = await fetch(url);
+    if(!r.ok){
+      const t = await r.text();
+      throw new Error(`HTTP ${r.status}: ${t}`);
+    }
+    const data = await r.json();
+
+    // Headline
+    document.getElementById("headline").style.display = "block";
+    document.getElementById("summaryGrid").style.display = "grid";
+
+    const name = pick(data,"market_snapshot.name") || "—";
+    const sector = pick(data,"market_snapshot.sector") || "—";
+    const industry = pick(data,"market_snapshot.industry") || "—";
+    document.getElementById("metaLine").textContent = `${name} • ${sector} • ${industry}`;
+    document.getElementById("asof").textContent = `asof_utc: ${pick(data,"asof_utc") || "—"}`;
+
+    // Price
+    const lastPx = pick(data,"market_snapshot.last_price");
+    document.getElementById("px").textContent = fmt(lastPx, 3);
+    document.getElementById("pxMeta").textContent = `last_date: ${pick(data,"market_snapshot.last_date") || "—"} • currency: ${pick(data,"market_snapshot.currency") || "—"}`;
+
+    // DCF distribution (expecting keys; if your JSON uses different names, adjust here only)
+    const dcfP50 = pick(data,"valuation.dcf.p50") ?? pick(data,"dcf.p50");
+    const dcfP25 = pick(data,"valuation.dcf.p25") ?? pick(data,"dcf.p25");
+    const dcfP75 = pick(data,"valuation.dcf.p75") ?? pick(data,"dcf.p75");
+    document.getElementById("dcfP50").textContent = fmt(dcfP50, 3);
+    document.getElementById("dcfBand").textContent = `P25 ${fmt(dcfP25,3)}  •  P75 ${fmt(dcfP75,3)}`;
+
+    // Gap
+    if (Number.isFinite(Number(lastPx)) && Number.isFinite(Number(dcfP50))){
+      const gap = Number(dcfP50) - Number(lastPx);
+      const gp = gap / Number(lastPx);
+      document.getElementById("gap").textContent = fmt(gap, 3);
+      document.getElementById("gapPct").textContent = fmtPct(gp, 2);
+    } else {
+      document.getElementById("gap").textContent = "—";
+      document.getElementById("gapPct").textContent = "—";
+    }
+
+    // Peer z-score
+    const z = pick(data,"peer_multiples.zscore_composite");
+    const zLabel = (z===undefined) ? "—" : fmt(z, 2);
+    document.getElementById("peerZ").textContent = zLabel;
+    const peerNote = pick(data,"peer_multiples.note") || "—";
+    const used = pick(data,"peer_multiples.used_multiples") || [];
+    document.getElementById("peerDetails").textContent =
+      `Used: ${Array.isArray(used) ? used.join(", ") : "—"} • ${peerNote}`;
+
+    // Forecast
+    const fcP50 = pick(data,"forecast.p50");
+    const fcP25 = pick(data,"forecast.p25");
+    const fcP75 = pick(data,"forecast.p75");
+    document.getElementById("fc").textContent = fmt(fcP50, 3);
+    document.getElementById("fcBand").textContent = `P25 ${fmt(fcP25,3)}  •  P75 ${fmt(fcP75,3)}`;
+
+    // Verdict
+    const verdict = pick(data,"decision.verdict") || pick(data,"verdict");
+    document.getElementById("verdictText").textContent = verdict || "—";
+    setBadge(verdict);
+
+    // Warnings
+    const w = [];
+    const dq = pick(data,"data_quality");
+    if (dq && dq.price_warnings) w.push(...dq.price_warnings);
+    if (dq && dq.fundamentals_warnings) w.push(...dq.fundamentals_warnings);
+    const pmw = pick(data,"peer_multiples.warnings");
+    if (Array.isArray(pmw)) w.push(...pmw);
+    document.getElementById("warn").textContent = w.length ? w.join(" | ") : "None";
+
+    // Audit JSON
+    document.getElementById("audit").textContent = JSON.stringify(data, null, 2);
+
+    status.textContent = "Done.";
+  } catch(e){
+    document.getElementById("errorCard").style.display = "block";
+    document.getElementById("errText").textContent = String(e);
+    status.textContent = "";
+  } finally{
+    btn.disabled = false;
+  }
+}
+
+document.getElementById("btn").addEventListener("click", run);
+</script>
+</body>
+</html>
+    """
+    @app.get("/ui", response_class=HTMLResponse)
+def ui():
+    return home()
 @app.get("/prices")
 def prices(ticker: str = Query(..., description="e.g., 2222.SR")):
     payload = get_prices_with_fallback(ticker)
@@ -1050,7 +1358,24 @@ def analyze(
     key_info = extract_key_info(fund_payload)
 
     # Multiples
-    multiples = compute_multiples_from_info(current_price, key_info)
+multiples = compute_multiples_from_info(current_price, key_info)
+company_multiples = {
+    "pe": multiples.get("trailing_pe"),
+    "pb": multiples.get("price_to_book"),
+    "ps": multiples.get("price_to_sales"),
+    "ev_ebitda": multiples.get("ev_to_ebitda"),
+}
+
+try:
+    peers_df = load_peer_multiples_csv()
+    peer_block = compute_peer_multiples_zscores(
+        ticker=ticker,
+        sector=key_info.get("sector"),
+        company_multiples=company_multiples,
+        peers_df=peers_df,
+    )
+except Exception as e:
+    peer_block = {"available": False, "warnings": [str(e)]}
 
     # DCF
     dcf_inputs, dcf_warnings = dcf_inputs_from_fundamentals(fund_payload, multiples)
@@ -1075,6 +1400,7 @@ def analyze(
             "currency": key_info.get("currency"),
             "name": key_info.get("longName") or key_info.get("shortName"),
             "sector": key_info.get("sector"),
+            "peer_multiples": peer_block,
             "industry": key_info.get("industry"),
         },
         "data_quality": {

@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import os, math, random
 from datetime import datetime
-from typing import Optional
-
 import numpy as np
 import pandas as pd
 import requests
-
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
+from typing import Optional, List, Dict, Any
+import numpy as np
+import pandas as pd
+import requests
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -57,21 +59,7 @@ def json_safe(obj):
 # Foundation, Configuration, and Utilities
 # =========================================================
 
-from __future__ import annotations
 
-import os
-import math
-from datetime import datetime
-from typing import Optional, List, Dict, Any
-
-import numpy as np
-import pandas as pd
-import requests
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
 
 # =========================================================
 # 0) APP + ROUTES + CORS

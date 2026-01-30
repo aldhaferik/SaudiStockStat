@@ -1358,24 +1358,24 @@ def analyze(
     key_info = extract_key_info(fund_payload)
 
     # Multiples
-multiples = compute_multiples_from_info(current_price, key_info)
-company_multiples = {
-    "pe": multiples.get("trailing_pe"),
-    "pb": multiples.get("price_to_book"),
-    "ps": multiples.get("price_to_sales"),
-    "ev_ebitda": multiples.get("ev_to_ebitda"),
-}
+    multiples = compute_multiples_from_info(current_price, key_info)
+    company_multiples = {
+        "pe": multiples.get("trailing_pe"),
+        "pb": multiples.get("price_to_book"),
+        "ps": multiples.get("price_to_sales"),
+        "ev_ebitda": multiples.get("ev_to_ebitda"),
+    }
 
-try:
-    peers_df = load_peer_multiples_csv()
-    peer_block = compute_peer_multiples_zscores(
-        ticker=ticker,
-        sector=key_info.get("sector"),
-        company_multiples=company_multiples,
-        peers_df=peers_df,
-    )
-except Exception as e:
-    peer_block = {"available": False, "warnings": [str(e)]}
+    try:
+        peers_df = load_peer_multiples_csv()
+        peer_block = compute_peer_multiples_zscores(
+            ticker=ticker,
+            sector=key_info.get("sector"),
+            company_multiples=company_multiples,
+            peers_df=peers_df,
+       )
+    except Exception as e:
+        peer_block = {"available": False, "warnings": [str(e)]}
 
     # DCF
     dcf_inputs, dcf_warnings = dcf_inputs_from_fundamentals(fund_payload, multiples)

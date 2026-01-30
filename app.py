@@ -1,3 +1,60 @@
+# ==========================
+# PART 1: Foundation & Config
+# ==========================
+from __future__ import annotations
+
+import os, math, random
+from datetime import datetime
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import requests
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/", response_class=HTMLResponse)
+async def read_root():
+    return """<html><body><h2>Saudi Valuator Pro is running.</h2><p>Use the UI here: <a href='/ui'>/ui</a></p><p>Docs: <a href='/docs'>/docs</a></p></body></html>"""
+
+# ==========================
+# PART 2: Settings & Constants
+# ==========================
+DEFAULT_HISTORY_PERIOD = "5y"
+TRADING_DAYS = 252
+BETA_LOOKBACK_DAYS = TRADING_DAYS * 2
+MARKET_RETURN_LOOKBACK_DAYS = TRADING_DAYS * 5
+FORECAST_YEARS = 5
+SPREAD_HORIZON_DAYS = 21
+
+TASI_TICKER = "^TASI.SR"
+ALPHA_VANTAGE_KEY = "0LR5JLOBSLOA6Z0A"
+TWELVE_DATA_KEY = "ed240f406bab4225ac6e0a98be553aa2"
+RISK_FREE_XLSX_PATH = "saudi_yields.xlsx"
+RISK_FREE_COLUMN_NAME = "10-Year government bond yield"
+
+# ==========================
+# PART 3: Helpers & Utilities
+# ==========================
+def json_safe(obj):
+    if obj is None: return None
+    if isinstance(obj, (np.floating, np.integer)): return obj.item()
+    if isinstance(obj, float): return float(obj) if np.isfinite(obj) else None
+    if isinstance(obj, dict): return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)): return [json_safe(v) for v in obj]
+    return obj
 # =========================================================
 # Saudi Valuator Pro — PART 1
 # Foundation, Configuration, and Utilities
@@ -489,7 +546,56 @@ async def analyze_stock(req: AnalyzeRequest):
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-        # =========================================================
+
+# 7) PRICE FORECASTER ENDPOINT (PURE STATISTICAL MODEL)
+
+from sklearn.linear_model import RidgeCV
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+
+@app.post("/forecast")
+async def forecast_price(req: ValuationRequest):
+    import yfinance as yf
+
+    ticker = req.ticker
+    data = yf.download(f"{ticker}.SR", period="5y")
+    if data.empty:
+        raise HTTPException(status_code=404, detail="Ticker data not found.")
+
+    df = data[["Close"]].copy()
+    df["Return"] = df["Close"].pct_change()
+    df["MA20"] = df["Close"].rolling(20).mean()
+    df["MA50"] = df["Close"].rolling(50).mean()
+    df["Volatility"] = df["Return"].rolling(20).std()
+    df = df.dropna()
+
+    df["Target"] = df["Close"].shift(-21)  # Predict 1-month ahead (~21 trading days)
+    df = df.dropna()
+
+    X = df[["Close", "Return", "MA20", "MA50", "Volatility"]]
+    y = df["Target"]
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, shuffle=False, test_size=0.2)
+
+    model = GradientBoostingRegressor(n_estimators=100, max_depth=4)
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    rmse = round(mean_squared_error(y_test, y_pred, squared=False), 2)
+    latest_price = round(df["Close"].iloc[-1], 2)
+    forecast_price = round(model.predict(X.iloc[[-1]])[0], 2)
+
+    return {
+        "ticker": ticker,
+        "latest_price": latest_price,
+        "forecast_price_1mo": forecast_price,
+        "rmse": rmse,
+        "model": "GradientBoosting (pure statistical)",
+        "features_used": ["Close", "Return", "MA20", "MA50", "Volatility"]
+    }
+
+# =========================================================
 # app.py — PART 7
 # Interactive UI Page (/ui)
 # =========================================================

@@ -1,6 +1,3 @@
-# ==========================
-# PART 1: Foundation & Config
-# ==========================
 from __future__ import annotations
 
 import os, math, random

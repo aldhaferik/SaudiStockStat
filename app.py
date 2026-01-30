@@ -623,4 +623,292 @@ async def train_test_info():
         return summary
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-        
+        # =========================================================
+# 9) FUNDAMENTALS LOADING + ESTIMATION HELPERS
+#    - Used by DCF and Multiples models
+#    - Pulls local .xlsx, parses fundamentals, calculates Rf, β, etc.
+# =========================================================
+
+def load_fundamentals(ticker: str, fundamentals_path: str = "fundamentals") -> dict:
+    """
+    Load fundamental data from pre-downloaded Excel files.
+    Files should be in a directory like: fundamentals/2222.xlsx
+    """
+    file_path = os.path.join(fundamentals_path, f"{ticker}.xlsx")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Missing financials file: {file_path}")
+
+    df = pd.read_excel(file_path, sheet_name=None)
+    income = df.get("Income Statement")
+    balance = df.get("Balance Sheet")
+    cashflow = df.get("Cash Flow")
+
+    if income is None or balance is None or cashflow is None:
+        raise ValueError(f"Missing sheet(s) in {file_path}")
+
+    return {
+        "income": income,
+        "balance": balance,
+        "cashflow": cashflow,
+    }
+
+
+def estimate_growth(income_df: pd.DataFrame, column="Net Income") -> float:
+    """
+    Estimate forward growth rate using log regression on net income.
+    """
+    try:
+        series = income_df[column].dropna().tail(5)
+        log_vals = np.log(series.values)
+        years = np.arange(len(log_vals))
+        slope, _ = np.polyfit(years, log_vals, 1)
+        return round(np.exp(slope) - 1, 4)
+    except Exception:
+        return 0.03  # fallback 3%
+
+
+def estimate_beta(ticker: str, market_index: str = TASI_TICKER) -> float:
+    """
+    Estimate CAPM beta by regressing stock returns on TASI.
+    """
+    import yfinance as yf
+    try:
+        stock = yf.download(ticker + ".SR", period=DEFAULT_HISTORY_PERIOD)
+        index = yf.download(market_index, period=DEFAULT_HISTORY_PERIOD)
+        stock_ret = stock["Adj Close"].pct_change().dropna()
+        index_ret = index["Adj Close"].pct_change().dropna()
+        merged = pd.merge(stock_ret, index_ret, left_index=True, right_index=True, suffixes=("_stock", "_index"))
+        beta = np.cov(merged["_stock"], merged["_index"])[0, 1] / np.var(merged["_index"])
+        return round(beta, 3)
+    except Exception:
+        return 1.0  # fallback beta
+
+
+def get_risk_free_rate(bond_path: str = RISK_FREE_XLSX_PATH, column_name: str = RISK_FREE_COLUMN_NAME) -> float:
+    """
+    Extract latest risk-free rate from Saudi bond yield Excel.
+    """
+    try:
+        df = pd.read_excel(bond_path)
+        latest = df[column_name].dropna().iloc[-1]
+        return round(float(latest) / 100, 4)  # convert from % to decimal
+    except Exception:
+        return 0.05  # fallback 5%
+
+
+def get_equity_cost(rf: float, beta: float, mrp: float = 0.07) -> float:
+    """
+    CAPM cost of equity: Rf + β * MRP
+    """
+    return round(rf + beta * mrp, 4)
+
+
+def get_wacc(rf: float, beta: float, debt_cost: float, equity_ratio: float, tax_rate: float = 0.2) -> float:
+    """
+    Estimate Weighted Average Cost of Capital (WACC)
+    """
+    re = get_equity_cost(rf, beta)
+    rd = debt_cost
+    wd = 1 - equity_ratio
+    we = equity_ratio
+    wacc = we * re + wd * rd * (1 - tax_rate)
+    return round(wacc, 4)
+# =========================================================
+# 10) MULTIPLES VALUATION ENGINE
+#     - Uses: time-aligned Price / EPS, BV, EBITDA
+#     - Filters invalid entries and builds valuation bands
+# =========================================================
+
+def compute_historical_multiples(fundamentals: dict, market_prices: pd.Series) -> pd.DataFrame:
+    """
+    Construct historical valuation multiples using fundamentals and market prices.
+    Returns: DataFrame with date-aligned P/E, P/B, EV/EBITDA, etc.
+    """
+    income = fundamentals["income"]
+    balance = fundamentals["balance"]
+    cashflow = fundamentals["cashflow"]
+
+    df = pd.DataFrame(index=income.index)
+    df["EPS"] = income["Net Income"] / balance["Total Shares Outstanding"]
+    df["BVPS"] = balance["Total Equity"] / balance["Total Shares Outstanding"]
+    df["EBITDA"] = income["Operating Profit"] + income.get("Depreciation", 0)
+
+    df["Price"] = [
+        market_prices.loc[:date].iloc[-1] if not market_prices.loc[:date].empty else np.nan
+        for date in df.index
+    ]
+
+    df["P/E"] = df["Price"] / df["EPS"]
+    df["P/B"] = df["Price"] / df["BVPS"]
+    df["EV/EBITDA"] = df["Price"] / df["EBITDA"]
+
+    return df.dropna()
+
+
+def estimate_value_from_multiples(multiples_df: pd.DataFrame) -> dict:
+    """
+    Estimate value based on mean/median of historical multiples.
+    Returns: dict with fair value ranges
+    """
+    results = {}
+
+    for multiple in ["P/E", "P/B", "EV/EBITDA"]:
+        if multiple not in multiples_df.columns:
+            continue
+        mult_series = multiples_df[multiple].dropna()
+        if mult_series.empty:
+            continue
+
+        avg_mult = mult_series.mean()
+        med_mult = mult_series.median()
+        latest = multiples_df.iloc[-1]
+
+        if multiple == "P/E":
+            fair_avg = avg_mult * latest["EPS"]
+            fair_med = med_mult * latest["EPS"]
+        elif multiple == "P/B":
+            fair_avg = avg_mult * latest["BVPS"]
+            fair_med = med_mult * latest["BVPS"]
+        elif multiple == "EV/EBITDA":
+            fair_avg = avg_mult * latest["EBITDA"]
+            fair_med = med_mult * latest["EBITDA"]
+        else:
+            continue
+
+        results[multiple] = {
+            "average_multiple": round(avg_mult, 2),
+            "median_multiple": round(med_mult, 2),
+            "fair_value_avg": round(fair_avg, 2),
+            "fair_value_med": round(fair_med, 2),
+        }
+
+    return results
+
+
+def get_current_price(ticker: str) -> float:
+    """
+    Get the latest stock price from Yahoo Finance (in SAR).
+    """
+    import yfinance as yf
+    try:
+        data = yf.download(ticker + ".SR", period="5d", interval="1d")
+        price = data["Close"].iloc[-1]
+        return round(price, 2)
+    except Exception:
+        return np.nan
+# =========================================================
+# 11) FINAL VALUATION AGGREGATOR
+#     - Merge DCF + Multiples + Current Price
+#     - Classify: Undervalued / Fair / Overvalued
+# =========================================================
+
+def valuation_report(ticker: str, models: dict, price: float) -> dict:
+    """
+    Aggregate results from models (DCF, Multiples) and compare to market price.
+    Returns: full report including classification and confidence bounds.
+    """
+    dcf = models.get("dcf", {})
+    mult = models.get("multiples", {})
+    dcf_vals = []
+
+    # Collect all fair values from DCF (base, bear, bull)
+    for k in ["base", "bear", "bull"]:
+        if k in dcf:
+            dcf_vals.append(dcf[k]["value"])
+
+    # Collect all fair values from Multiples
+    for method in mult.values():
+        dcf_vals += [method.get("fair_value_avg", np.nan), method.get("fair_value_med", np.nan)]
+
+    # Remove invalid entries
+    fair_values = [v for v in dcf_vals if isinstance(v, (int, float)) and not np.isnan(v)]
+
+    if not fair_values:
+        return {"error": "No valid fair value estimates available."}
+
+    # Calculate average fair value
+    mean_fv = np.mean(fair_values)
+    std_fv = np.std(fair_values)
+
+    valuation_band = (round(mean_fv - std_fv, 2), round(mean_fv + std_fv, 2))
+
+    # Classification
+    if price < valuation_band[0]:
+        verdict = "Undervalued"
+    elif price > valuation_band[1]:
+        verdict = "Overvalued"
+    else:
+        verdict = "Fairly Valued"
+
+    return {
+        "ticker": ticker,
+        "current_price": price,
+        "valuation_mean": round(mean_fv, 2),
+        "valuation_band": valuation_band,
+        "verdict": verdict,
+        "sources_used": {
+            "DCF": list(dcf.keys()),
+            "Multiples": list(mult.keys())
+        }
+    }
+# =========================================================
+# 12) ANALYZE ROUTE (POST /analyze)
+# =========================================================
+
+class AnalyzeRequest(BaseModel):
+    ticker: str
+
+@app.post("/analyze")
+async def analyze(request: AnalyzeRequest):
+    ticker = request.ticker.upper()
+
+    try:
+        # 1. Load data
+        fin = fetch_fundamentals(ticker)
+        price = fetch_current_price(ticker)
+
+        # Validate
+        if fin.empty or np.isnan(price):
+            return JSONResponse(
+                status_code=422,
+                content={"error": "Missing data for ticker: EPS, FCFF, or current price unavailable"}
+            )
+
+        # 2. Run models
+        dcf_results = run_dcf_valuation(ticker, fin)
+        multiple_results = run_multiples_valuation(ticker, fin)
+        all_models = {
+            "dcf": dcf_results,
+            "multiples": multiple_results
+        }
+
+        # 3. Verdict
+        final_report = valuation_report(ticker, all_models, price)
+
+        # 4. Return
+        return {
+            "ticker": ticker,
+            "price": price,
+            "valuation": final_report,
+            "dcf_model": dcf_results,
+            "multiples_model": multiple_results
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Unhandled error: {str(e)}"}
+        )
+# =========================================================
+# 14) HEALTH CHECK + APP LAUNCH
+# =========================================================
+
+@app.get("/health", response_class=JSONResponse)
+async def health():
+    return {"status": "alive", "app": "Saudi Valuator Pro"}
+
+# Main entry point
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+

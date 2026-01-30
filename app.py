@@ -1378,8 +1378,11 @@ def analyze(
         peer_block = {"available": False, "warnings": [str(e)]}
 
     # DCF
-    dcf_inputs, dcf_warnings = dcf_inputs_from_fundamentals(fund_payload, multiples)
-    dcf_res = dcf_monte_carlo(dcf_inputs, n=dcf_samples, seed=7)
+    dcf_inputs, dcf_warnings = dcf_inputs_from_fundamentals(fund_payload, multiples
+    if not dcf_inputs or not np.isfinite(dcf_inputs.get("fcf", np.nan)):
+        dcf_res = {}
+    else:
+        dcf_res = dcf_monte_carlo(dcf_inputs, n=dcf_samples, seed=7)
     if dcf_warnings:
         dcf_res.setdefault("warnings", [])
         dcf_res["warnings"] = list(dcf_res["warnings"]) + dcf_warnings

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: saudi-stock-analyzer
+    env: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install --upgrade pip && pip install -r requirements_render.txt
+    startCommand: streamlit run render_saudi_analyzer.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
+      - key: PIP_NO_BUILD_ISOLATION
+        value: "false"

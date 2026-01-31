@@ -2,8 +2,15 @@ services:
   - type: web
     name: saudi-stock-analyzer
     env: python
-    buildCommand: pip install -r requirements_render.txt
+    buildCommand: |
+      python -m pip install --upgrade pip==23.3.1
+      pip install setuptools==68.2.2 wheel==0.41.2
+      pip install --no-cache-dir --force-reinstall -r requirements_render.txt
     startCommand: streamlit run render_saudi_analyzer.py --server.port $PORT --server.address 0.0.0.0
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.4
+        value: 3.11.7
+      - key: PIP_NO_BUILD_ISOLATION
+        value: "false"
+      - key: SETUPTOOLS_USE_DISTUTILS
+        value: "stdlib"
